@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+openai
+ddgs
+crawl4ai
+python-dotenv
+pydantic
