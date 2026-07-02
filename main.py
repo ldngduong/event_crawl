@@ -6,9 +6,34 @@ if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, HTTPException, Query
-from typing import List
-from schemas import WeddingList, WeddingInfo
+from typing import Optional
+from schemas import (
+    EagleIngestResponse,
+    HumanitixCrawlResponse,
+    HumanitixIngestRequest,
+    MeetupIngestRequest,
+    StubHubIngestRequest,
+    UniverseIngestRequest,
+    WeddingInfo,
+    WeddingList,
+)
 from crawler import search_wedding_urls, extract_wedding_data
+from humanitix_crawler import (
+    crawl_humanitix_events_with_diagnostics,
+    ingest_humanitix_events_to_eagle,
+)
+from universe_crawler import (
+    crawl_universe_events_with_diagnostics,
+    ingest_universe_events_to_eagle,
+)
+from meetup_crawler import (
+    crawl_meetup_events_with_diagnostics,
+    ingest_meetup_events_to_eagle,
+)
+from stubhub_crawler import (
+    crawl_stubhub_events_with_diagnostics,
+    preview_stubhub_events,
+)
 import uvicorn
 import logging
 
@@ -17,14 +42,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Wedding Event Crawler API",
-    description="Crawls wedding websites for upcoming events in specific locations using Crawl4AI and Groq.",
+    title="Eagle Event Crawler API",
+    description="Crawls public event sources and wedding websites using Crawl4AI, JSON-LD, and source-specific APIs.",
     version="1.0.0"
 )
 
 @app.get("/")
 async def root():
-    return {"message": "Wedding Crawler API is running. Use /weddings/{location} to start crawling."}
+    return {
+        "message": "Crawler API is running.",
+        "endpoints": {
+            "weddings": "/weddings/{location}",
+            "humanitix_events": "/humanitix/events/{location}",
+            "humanitix_ingest": "/humanitix/events/ingest",
+            "universe_ingest": "/universe/events/ingest",
+            "meetup_ingest": "/meetup/events/ingest",
+            "stubhub_ingest": "/stubhub/events/ingest",
+        }
+    }
 
 @app.get("/weddings/{location}", response_model=WeddingList)
 async def get_weddings(
@@ -56,5 +91,211 @@ async def get_weddings(
         logger.error(f"Error processing request: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/humanitix/events/ingest", response_model=EagleIngestResponse)
+async def ingest_humanitix_events(request: HumanitixIngestRequest):
+    """
+    Crawl Humanitix event pages, then send the crawled events to Eagle backend for direct DB import.
+    Set persist=false to only return crawled events without writing database rows.
+    """
+    logger.info(
+        "Received request for Humanitix ingest organization='%s' workspace='%s' location='%s' keyword='%s' persist=%s",
+        request.organization_id,
+        request.workspace_id,
+        request.location,
+        request.keyword,
+        request.persist,
+    )
+    try:
+        crawl_result = await crawl_humanitix_events_with_diagnostics(
+            keyword=request.keyword,
+            location=request.location,
+            limit=request.limit,
+            source=request.source,
+        )
+        return await ingest_humanitix_events_to_eagle(
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
+            events=crawl_result["events"],
+            parse_failures=crawl_result["parse_failures"],
+            persist=request.persist,
+        )
+    except Exception as e:
+        logger.error(f"Error ingesting Humanitix events: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/humanitix/events/ingest")
+async def humanitix_ingest_usage():
+    return {
+        "message": "Use POST /humanitix/events/ingest to crawl Humanitix and import events into Eagle.",
+        "example_body": {
+            "organization_id": "organization-uuid",
+            "workspace_id": "workspace-uuid",
+            "location": "au--nsw--sydney",
+            "keyword": "conference",
+            "source": "auto",
+            "limit": 20,
+            "persist": True,
+        },
+        "note": "persist=false only crawls and returns events. persist=true posts the crawled events to /api/v1/scraper/events/humanitix-import and writes DB.",
+    }
+
+
+@app.get("/humanitix/events/{location}", response_model=HumanitixCrawlResponse)
+async def get_humanitix_events(
+    location: str,
+    keyword: str = Query("conference", description="Search keyword, e.g. conference, meetup, expo"),
+    source: str = Query("auto", pattern="^(auto|api|html)$", description="Crawl source: auto, api, or html"),
+    limit: int = Query(20, ge=1, le=1000, description="Max Humanitix events to crawl"),
+):
+    """
+    Search Humanitix event pages and crawl public JSON-LD data without using an API key.
+    Prefer passing the Humanitix location slug, e.g. au--nsw--sydney or us--ny--new-york.
+    """
+    logger.info(
+        "Received request for Humanitix crawl location='%s' keyword='%s' source=%s limit=%s",
+        location,
+        keyword,
+        source,
+        limit,
+    )
+    try:
+        crawl_result = await crawl_humanitix_events_with_diagnostics(
+            keyword=keyword,
+            location=location,
+            limit=limit,
+            source=source,  # type: ignore[arg-type]
+        )
+        return {
+            "count": len(crawl_result["events"]),
+            "events": crawl_result["events"],
+            "parse_failures": crawl_result["parse_failures"],
+        }
+    except Exception as e:
+        logger.error(f"Error crawling Humanitix: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/universe/events/ingest", response_model=EagleIngestResponse)
+async def ingest_universe_events(request: UniverseIngestRequest):
+    """
+    Crawl Universe events via the same GraphQL API used by universe.com.
+    Set persist=false to only return crawled events without writing database rows.
+    """
+    logger.info(
+        "Received request for Universe ingest location='%s' ll='%s' keyword='%s' source=%s limit=%s persist=%s",
+        request.location,
+        request.ll,
+        request.keyword,
+        request.source,
+        request.limit,
+        request.persist,
+    )
+    try:
+        crawl_result = await crawl_universe_events_with_diagnostics(
+            keyword=request.keyword,
+            location=request.location,
+            ll=request.ll,
+            limit=request.limit,
+            source=request.source,
+            enrich_details=request.enrich_details,
+        )
+        return await ingest_universe_events_to_eagle(
+            organization_id=None,
+            workspace_id=None,
+            events=crawl_result["events"],
+            parse_failures=crawl_result["parse_failures"],
+            persist=request.persist,
+        )
+    except Exception as e:
+        logger.error(f"Error crawling Universe: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/stubhub/events/ingest", response_model=EagleIngestResponse)
+async def ingest_stubhub_events(request: StubHubIngestRequest):
+    """
+    Crawl StubHub search results. Search prefers StubHub's public Algolia-backed
+    search data; detail enrichment parses schema.org JSON-LD from event pages.
+    persist=true is intentionally not wired until Eagle backend adds /stubhub-import.
+    """
+    logger.info(
+        "Received request for StubHub ingest keyword='%s' search_url='%s' source=%s limit=%s persist=%s",
+        request.keyword,
+        request.search_url,
+        request.source,
+        request.limit,
+        request.persist,
+    )
+    try:
+        crawl_result = await crawl_stubhub_events_with_diagnostics(
+            keyword=request.keyword,
+            search_url=request.search_url,
+            limit=request.limit,
+            source=request.source,
+            enrich_details=request.enrich_details,
+        )
+        return await preview_stubhub_events(
+            events=crawl_result["events"],
+            parse_failures=crawl_result["parse_failures"],
+            persist=request.persist,
+        )
+    except Exception as e:
+        logger.error(f"Error crawling StubHub: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/meetup/events/ingest", response_model=EagleIngestResponse)
+async def ingest_meetup_events(request: MeetupIngestRequest):
+    """
+    Crawl Meetup search results via Meetup's GraphQL eventSearch cursor flow.
+    Detail enrichment parses schema.org JSON-LD from event pages.
+    Set persist=false to only return crawled events without writing database rows.
+    """
+    logger.info(
+        "Received request for Meetup ingest keyword='%s' location='%s' search_url='%s' source=%s limit=%s persist=%s",
+        request.keyword,
+        request.location,
+        request.search_url,
+        request.source,
+        request.limit,
+        request.persist,
+    )
+    try:
+        crawl_result = await crawl_meetup_events_with_diagnostics(
+            search_url=request.search_url,
+            keyword=request.keyword,
+            location=request.location,
+            lat=request.lat,
+            lon=request.lon,
+            radius=request.radius,
+            limit=request.limit,
+            source=request.source,
+            enrich_details=request.enrich_details,
+        )
+        return await ingest_meetup_events_to_eagle(
+            events=crawl_result["events"],
+            parse_failures=crawl_result["parse_failures"],
+            persist=request.persist,
+        )
+    except Exception as e:
+        logger.error(f"Error crawling Meetup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    def proactor_loop_factory(use_subprocess: bool = False):
+        if sys.platform == "win32":
+            return asyncio.ProactorEventLoop()
+        return asyncio.new_event_loop()
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8006,
+        loop=proactor_loop_factory,
+        reload=False,
+    )
+
+
+

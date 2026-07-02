@@ -1,3 +1,8 @@
 .env
 /__pycache__
 log.md
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.crawl4ai_data/

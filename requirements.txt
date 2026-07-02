@@ -5,3 +5,4 @@ ddgs
 crawl4ai
 python-dotenv
 pydantic
+httpx
