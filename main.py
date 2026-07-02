@@ -9,8 +9,10 @@ from fastapi import FastAPI, HTTPException, Query
 from typing import Optional
 from schemas import (
     EagleIngestResponse,
+    DiscoverEventsIngestRequest,
     HumanitixCrawlResponse,
     HumanitixIngestRequest,
+    LumaIngestRequest,
     MeetupIngestRequest,
     StubHubIngestRequest,
     UniverseIngestRequest,
@@ -26,6 +28,10 @@ from universe_crawler import (
     crawl_universe_events_with_diagnostics,
     ingest_universe_events_to_eagle,
 )
+from luma_crawler import (
+    crawl_luma_events_with_diagnostics,
+    ingest_luma_events_to_eagle,
+)
 from meetup_crawler import (
     crawl_meetup_events_with_diagnostics,
     ingest_meetup_events_to_eagle,
@@ -33,6 +39,10 @@ from meetup_crawler import (
 from stubhub_crawler import (
     crawl_stubhub_events_with_diagnostics,
     preview_stubhub_events,
+)
+from discover_events_crawler import (
+    crawl_discover_events_with_diagnostics,
+    ingest_discover_events_to_eagle,
 )
 import uvicorn
 import logging
@@ -56,8 +66,10 @@ async def root():
             "humanitix_events": "/humanitix/events/{location}",
             "humanitix_ingest": "/humanitix/events/ingest",
             "universe_ingest": "/universe/events/ingest",
+            "luma_ingest": "/luma/events/ingest",
             "meetup_ingest": "/meetup/events/ingest",
             "stubhub_ingest": "/stubhub/events/ingest",
+            "discover_events_ingest": "/discover/events/ingest",
         }
     }
 
@@ -212,6 +224,46 @@ async def ingest_universe_events(request: UniverseIngestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/luma/events/ingest", response_model=EagleIngestResponse)
+async def ingest_luma_events(request: LumaIngestRequest):
+    """
+    Crawl Luma public discovery/calendar APIs, then optionally send the crawled
+    events to Eagle backend for direct DB import.
+    """
+    logger.info(
+        "Received request for Luma ingest category_slug='%s' calendar_api_id='%s' after='%s' before='%s' period=%s source=%s limit=%s persist=%s",
+        request.category_slug,
+        request.calendar_api_id,
+        request.after,
+        request.before,
+        request.period,
+        request.source,
+        request.limit,
+        request.persist,
+    )
+    try:
+        crawl_result = await crawl_luma_events_with_diagnostics(
+            category_slug=request.category_slug,
+            calendar_api_id=request.calendar_api_id,
+            after=request.after,
+            before=request.before,
+            period=request.period,
+            pagination_limit=request.pagination_limit,
+            max_calendars=request.max_calendars,
+            limit=request.limit,
+            source=request.source,
+        )
+        return await ingest_luma_events_to_eagle(
+            events=crawl_result["events"],
+            parse_failures=crawl_result["parse_failures"],
+            diagnostics=crawl_result.get("diagnostics"),
+            persist=request.persist,
+        )
+    except Exception as e:
+        logger.error(f"Error crawling Luma: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/stubhub/events/ingest", response_model=EagleIngestResponse)
 async def ingest_stubhub_events(request: StubHubIngestRequest):
     """
@@ -280,6 +332,45 @@ async def ingest_meetup_events(request: MeetupIngestRequest):
         )
     except Exception as e:
         logger.error(f"Error crawling Meetup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/discover/events/ingest", response_model=EagleIngestResponse)
+async def ingest_discover_events(request: DiscoverEventsIngestRequest):
+    """
+    Crawl Discover Events search results. Auto/html uses browser-rendered
+    infinite scroll, then parses schema.org JSON-LD and the Discover evt payload
+    from each detail page. Set persist=false to preview only.
+    """
+    logger.info(
+        "Received request for Discover Events ingest search_url='%s' lat=%s lng=%s day='%s' radius=%s source=%s limit=%s persist=%s",
+        request.search_url,
+        request.lat,
+        request.lng,
+        request.day,
+        request.radius,
+        request.source,
+        request.limit,
+        request.persist,
+    )
+    try:
+        crawl_result = await crawl_discover_events_with_diagnostics(
+            search_url=request.search_url,
+            lat=request.lat,
+            lng=request.lng,
+            day=request.day,
+            radius=request.radius,
+            limit=request.limit,
+            source=request.source,
+            enrich_details=request.enrich_details,
+        )
+        return await ingest_discover_events_to_eagle(
+            events=crawl_result["events"],
+            parse_failures=crawl_result["parse_failures"],
+            persist=request.persist,
+        )
+    except Exception as e:
+        logger.error(f"Error crawling Discover Events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
