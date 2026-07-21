@@ -6,6 +6,7 @@ import re
 from html import unescape
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
+from generic_mapper import ingest_generic_events_to_eagle
 
 import httpx
 
@@ -477,29 +478,19 @@ async def crawl_stubhub_events_with_diagnostics(
     }
 
 
-async def preview_stubhub_events(
+async def ingest_stubhub_events_to_eagle(
     *,
+    organization_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
     events: List[Dict[str, Any]],
     parse_failures: Optional[List[Dict[str, Any]]] = None,
     persist: bool = False,
 ) -> Dict[str, Any]:
-    return {
-        "mode": "preview",
-        "eagle_ingest_url": "",
-        "eagle_endpoint_url": "",
-        "crawled_count": len(events),
-        "normalized_count": 0,
-        "ingested_count": 0,
-        "created_count": 0,
-        "updated_count": 0,
-        "skipped_count": 0,
-        "failed_count": 1 if persist else 0,
-        "events": events,
-        "results": [],
-        "failures": (
-            [{"reason": "stubhub_persist_not_implemented", "note": "Crawler preview is ready; add Eagle /stubhub-import before persist=true."}]
-            if persist
-            else []
-        ),
-        "parse_failures": parse_failures or [],
-    }
+    return await ingest_generic_events_to_eagle(
+        organization_id=organization_id,
+        workspace_id=workspace_id,
+        events=events,
+        source_provider="stubhub",
+        parse_failures=parse_failures,
+        persist=persist,
+    )

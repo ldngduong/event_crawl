@@ -38,7 +38,7 @@ from meetup_crawler import (
 )
 from stubhub_crawler import (
     crawl_stubhub_events_with_diagnostics,
-    preview_stubhub_events,
+    ingest_stubhub_events_to_eagle,
 )
 from discover_events_crawler import (
     crawl_discover_events_with_diagnostics,
@@ -213,8 +213,8 @@ async def ingest_universe_events(request: UniverseIngestRequest):
             enrich_details=request.enrich_details,
         )
         return await ingest_universe_events_to_eagle(
-            organization_id=None,
-            workspace_id=None,
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
             events=crawl_result["events"],
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,
@@ -254,6 +254,8 @@ async def ingest_luma_events(request: LumaIngestRequest):
             source=request.source,
         )
         return await ingest_luma_events_to_eagle(
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
             events=crawl_result["events"],
             parse_failures=crawl_result["parse_failures"],
             diagnostics=crawl_result.get("diagnostics"),
@@ -287,7 +289,9 @@ async def ingest_stubhub_events(request: StubHubIngestRequest):
             source=request.source,
             enrich_details=request.enrich_details,
         )
-        return await preview_stubhub_events(
+        return await ingest_stubhub_events_to_eagle(
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
             events=crawl_result["events"],
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,
@@ -326,6 +330,8 @@ async def ingest_meetup_events(request: MeetupIngestRequest):
             enrich_details=request.enrich_details,
         )
         return await ingest_meetup_events_to_eagle(
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
             events=crawl_result["events"],
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,
@@ -365,6 +371,8 @@ async def ingest_discover_events(request: DiscoverEventsIngestRequest):
             enrich_details=request.enrich_details,
         )
         return await ingest_discover_events_to_eagle(
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
             events=crawl_result["events"],
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,

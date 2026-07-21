@@ -2,6 +2,8 @@ import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
+from generic_mapper import ingest_generic_events_to_eagle
+
 import httpx
 
 LumaSource = Literal["auto", "api", "html"]
@@ -383,93 +385,21 @@ def _sanitize_luma_event_for_eagle(event: Dict[str, Any]) -> Dict[str, Any]:
 
 async def ingest_luma_events_to_eagle(
     *,
+    organization_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
     events: List[Dict[str, Any]],
     parse_failures: Optional[List[Dict[str, Any]]] = None,
     diagnostics: Optional[Dict[str, Any]] = None,
     persist: bool = False,
 ) -> Dict[str, Any]:
-    eagle_api_base_url = os.getenv("EAGLE_API_BASE_URL", DEFAULT_EAGLE_API_BASE_URL).rstrip("/")
-    endpoint_url = f"{eagle_api_base_url}/scraper/events/luma-import"
-    batch_size = max(1, int(os.getenv("EAGLE_IMPORT_BATCH_SIZE", str(DEFAULT_EAGLE_IMPORT_BATCH_SIZE))))
-    results: List[Dict[str, Any]] = []
-    failures: List[Dict[str, Any]] = []
-
-    if not persist:
-        return {
-            "mode": "preview",
-            "eagle_ingest_url": endpoint_url,
-            "eagle_endpoint_url": endpoint_url,
-            "crawled_count": len(events),
-            "normalized_count": 0,
-            "ingested_count": 0,
-            "created_count": 0,
-            "updated_count": 0,
-            "skipped_count": 0,
-            "failed_count": 0,
-            "events": events,
-            "results": [],
-            "failures": [],
-            "parse_failures": parse_failures or [],
-            "diagnostics": diagnostics or {},
-        }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        for start in range(0, len(events), batch_size):
-            batch = [_sanitize_luma_event_for_eagle(event) for event in events[start : start + batch_size]]
-            batch_meta = {
-                "batch_start": start,
-                "batch_end": start + len(batch) - 1,
-                "event_count": len(batch),
-                "source_urls": [event.get("url") or event.get("source_url") for event in batch[:5]],
-            }
-            try:
-                response = await client.post(endpoint_url, json={"events": batch, "parseFailures": parse_failures or []})
-                response.raise_for_status()
-                eagle_response = response.json()
-                results.append({**batch_meta, "eagle_response": eagle_response})
-                eagle_data = eagle_response.get("data") if isinstance(eagle_response.get("data"), dict) else eagle_response
-                if isinstance(eagle_data, dict) and eagle_data.get("failures"):
-                    for failure in eagle_data["failures"]:
-                        failures.append({**batch_meta, "failure": failure})
-            except httpx.HTTPStatusError as error:
-                failures.append(
-                    {
-                        **batch_meta,
-                        "status_code": error.response.status_code,
-                        "response": error.response.text[:2000],
-                    }
-                )
-            except Exception as error:
-                failures.append({**batch_meta, "reason": str(error)})
-
-    created_count = 0
-    updated_count = 0
-    skipped_count = 0
-    ingested_count = 0
-    for result in results:
-        response = result.get("eagle_response")
-        data = response.get("data") if isinstance(response, dict) and isinstance(response.get("data"), dict) else response
-        if not isinstance(data, dict):
-            continue
-        created_count += _as_int(data.get("created")) or 0
-        updated_count += _as_int(data.get("updated")) or 0
-        skipped_count += _as_int(data.get("skipped")) or 0
-        ingested_count += _as_int(data.get("count")) or 0
-
-    return {
-        "mode": "persist",
-        "eagle_ingest_url": endpoint_url,
-        "eagle_endpoint_url": endpoint_url,
-        "crawled_count": len(events),
-        "normalized_count": ingested_count,
-        "ingested_count": ingested_count,
-        "created_count": created_count,
-        "updated_count": updated_count,
-        "skipped_count": skipped_count,
-        "failed_count": len(failures),
-        "events": events,
-        "results": results,
-        "failures": failures,
-        "parse_failures": parse_failures or [],
-        "diagnostics": diagnostics or {},
-    }
+    response = await ingest_generic_events_to_eagle(
+        organization_id=organization_id,
+        workspace_id=workspace_id,
+        events=events,
+        source_provider="luma",
+        parse_failures=parse_failures,
+        persist=persist,
+    )
+    if diagnostics:
+        response["diagnostics"] = diagnostics
+    return response

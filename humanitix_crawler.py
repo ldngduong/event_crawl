@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
 
+from generic_mapper import ingest_generic_events_to_eagle
+
 os.environ.setdefault(
     "CRAWL4_AI_BASE_DIRECTORY",
     str(Path(__file__).resolve().parent / ".crawl4ai_data"),
@@ -856,108 +858,11 @@ async def ingest_humanitix_events_to_eagle(
     parse_failures: Optional[List[Dict[str, Any]]] = None,
     persist: bool = False,
 ) -> Dict[str, Any]:
-    eagle_api_base_url = os.getenv("EAGLE_API_BASE_URL", DEFAULT_EAGLE_API_BASE_URL).rstrip("/")
-    endpoint_url = f"{eagle_api_base_url}/scraper/events/humanitix-import"
-    batch_size = max(
-        1,
-        int(os.getenv("EAGLE_IMPORT_BATCH_SIZE", str(DEFAULT_EAGLE_IMPORT_BATCH_SIZE))),
+    return await ingest_generic_events_to_eagle(
+        organization_id=organization_id,
+        workspace_id=workspace_id,
+        events=events,
+        source_provider="humanitix",
+        parse_failures=parse_failures,
+        persist=persist,
     )
-    results: List[Dict[str, Any]] = []
-    failures: List[Dict[str, Any]] = []
-
-    if not persist:
-        return {
-            "mode": "preview",
-            "eagle_ingest_url": endpoint_url,
-            "eagle_endpoint_url": endpoint_url,
-            "crawled_count": len(events),
-            "normalized_count": 0,
-            "ingested_count": 0,
-            "failed_count": 0,
-            "events": events,
-            "results": [],
-            "failures": [],
-            "parse_failures": parse_failures or [],
-        }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        for start in range(0, len(events), batch_size):
-            batch = events[start : start + batch_size]
-            payload: Dict[str, Any] = {
-                "events": batch,
-                "parseFailures": parse_failures or [],
-            }
-            if organization_id:
-                payload["organizationId"] = organization_id
-            if workspace_id:
-                payload["workspaceId"] = workspace_id
-
-            batch_meta = {
-                "batch_start": start,
-                "batch_end": start + len(batch) - 1,
-                "event_count": len(batch),
-                "source_urls": [
-                    event.get("url") or event.get("source_url") or event.get("sourceUrl")
-                    for event in batch[:5]
-                ],
-            }
-
-            try:
-                response = await client.post(endpoint_url, json=payload)
-                response.raise_for_status()
-                eagle_response = response.json()
-                results.append(
-                    {
-                        **batch_meta,
-                        "eagle_response": eagle_response,
-                    }
-                )
-                failures.extend(eagle_response.get("failures") or [])
-            except httpx.HTTPStatusError as error:
-                failures.append(
-                    {
-                        **batch_meta,
-                        "status_code": error.response.status_code,
-                        "response": error.response.text,
-                    }
-                )
-            except Exception as error:
-                failures.append(
-                    {
-                        **batch_meta,
-                        "error": str(error),
-                    }
-                )
-
-    imported_count = 0
-    created_count = 0
-    updated_count = 0
-    skipped_count = 0
-    for result in results:
-        eagle_response = result.get("eagle_response", {})
-        eagle_data = (
-            eagle_response.get("data")
-            if isinstance(eagle_response.get("data"), dict)
-            else eagle_response
-        )
-        imported_count += int(eagle_data.get("count") or 0)
-        created_count += int(eagle_data.get("created") or 0)
-        updated_count += int(eagle_data.get("updated") or 0)
-        skipped_count += int(eagle_data.get("skipped") or 0)
-
-    return {
-        "mode": "persist",
-        "eagle_ingest_url": endpoint_url,
-        "eagle_endpoint_url": endpoint_url,
-        "crawled_count": len(events),
-        "normalized_count": imported_count,
-        "ingested_count": imported_count,
-        "created_count": created_count,
-        "updated_count": updated_count,
-        "skipped_count": skipped_count,
-        "failed_count": len(failures),
-        "events": events,
-        "results": results,
-        "failures": failures,
-        "parse_failures": parse_failures or [],
-    }

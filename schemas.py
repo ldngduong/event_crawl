@@ -30,6 +30,8 @@ class HumanitixCrawlResponse(BaseModel):
     parse_failures: List[dict] = Field(default_factory=list)
 
 class UniverseIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
     location: str = Field("New York, NY, USA", description="Universe location label, e.g. New York, NY, USA")
     ll: Optional[str] = Field(
         "40.7127753,-74.0059728",
@@ -45,6 +47,8 @@ class UniverseIngestRequest(BaseModel):
     persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
 
 class LumaIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
     category_slug: Optional[str] = Field(
         "tech",
         description="Luma discovery category slug, e.g. tech, food. Used when calendar_api_id is omitted.",
@@ -75,6 +79,8 @@ class LumaIngestRequest(BaseModel):
     persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
 
 class MeetupIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
     search_url: Optional[str] = Field(
         None,
         description="Optional full Meetup /find URL. Example: https://www.meetup.com/find/?location=us--ny--New+York&source=EVENTS&keywords=conference",
@@ -96,6 +102,8 @@ class MeetupIngestRequest(BaseModel):
     persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
 
 class DiscoverEventsIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
     search_url: Optional[str] = Field(
         None,
         description="Optional full Discover Events /forme URL. Example: https://discover.events.com/forme?lat=40.7127837&lng=-74.00594130000002&day=2026-7-3",
@@ -116,6 +124,8 @@ class DiscoverEventsIngestRequest(BaseModel):
     persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
 
 class StubHubIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
     keyword: Optional[str] = Field(
         None,
         description="Optional StubHub search keyword. Used only when search_url is omitted or has no q query.",
