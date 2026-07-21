@@ -12,6 +12,20 @@ class WeddingInfo(BaseModel):
 class WeddingList(BaseModel):
     weddings: List[WeddingInfo]
 
+class ConferankIngestRequest(BaseModel):
+    location: Optional[str] = Field(default=None, description="Filter by location (e.g. Las Vegas)")
+    date_from: Optional[str] = Field(default=None, description="Filter from date (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(default=None, description="Filter to date (YYYY-MM-DD)")
+    source: Literal["auto", "api", "html"] = Field(
+        "auto",
+        description="Conferank crawl source: auto/html uses HTML parsing since no API is available.",
+    )
+    limit: int = Field(default=100, description="Max events to fetch from Conferank list")
+    organization_id: Optional[str] = Field(default=None, description="Target Eagle organization ID")
+    workspace_id: Optional[str] = Field(default=None, description="Target Eagle workspace ID")
+    enrich_details: bool = Field(default=False, description="Fetch venue and sponsor subpages")
+    persist: bool = Field(default=True, description="Send data to backend")
+
 class HumanitixIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID, reserved for future workspace visibility")

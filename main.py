@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from typing import Optional
 from schemas import (
     EagleIngestResponse,
+    ConferankIngestRequest,
     DiscoverEventsIngestRequest,
     HumanitixCrawlResponse,
     HumanitixIngestRequest,
@@ -40,6 +41,11 @@ from stubhub_crawler import (
     crawl_stubhub_events_with_diagnostics,
     ingest_stubhub_events_to_eagle,
 )
+from conferank_crawler import (
+    crawl_conferank_events,
+    ingest_conferank_events_to_eagle,
+)
+from generic_mapper import ingest_generic_events_to_eagle
 from discover_events_crawler import (
     crawl_discover_events_with_diagnostics,
     ingest_discover_events_to_eagle,
@@ -285,8 +291,8 @@ async def ingest_stubhub_events(request: StubHubIngestRequest):
         crawl_result = await crawl_stubhub_events_with_diagnostics(
             keyword=request.keyword,
             search_url=request.search_url,
-            limit=request.limit,
             source=request.source,
+            limit=request.limit,
             enrich_details=request.enrich_details,
         )
         return await ingest_stubhub_events_to_eagle(
@@ -294,10 +300,31 @@ async def ingest_stubhub_events(request: StubHubIngestRequest):
             workspace_id=request.workspace_id,
             events=crawl_result["events"],
             parse_failures=crawl_result["parse_failures"],
+            diagnostics=crawl_result.get("diagnostics", {}),
             persist=request.persist,
         )
     except Exception as e:
         logger.error(f"Error crawling StubHub: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/conferank/events/ingest", response_model=EagleIngestResponse)
+async def ingest_conferank_events(request: ConferankIngestRequest):
+    try:
+        raw_events = await crawl_conferank_events(
+            limit=request.limit, 
+            enrich_details=request.enrich_details,
+            location=request.location,
+            date_from=request.date_from,
+            date_to=request.date_to
+        )
+        return await ingest_conferank_events_to_eagle(
+            events=raw_events,
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
+            persist=request.persist
+        )
+    except Exception as e:
+        logger.error(f"Error crawling Conferank: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
