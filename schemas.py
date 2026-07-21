@@ -123,6 +123,72 @@ class DiscoverEventsIngestRequest(BaseModel):
     enrich_details: bool = Field(True, description="Fetch event detail pages and parse schema.org JSON-LD plus Discover evt payload")
     persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
 
+class InternationalConferenceAlertsIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    search_url: Optional[str] = Field(
+        None,
+        description="Optional full InternationalConferenceAlerts search/detail URL. Example: https://internationalconferencealerts.com/conferences?q=tech&country=&month=",
+    )
+    q: Optional[str] = Field(None, description="Free-text search query from the ICA conferences page")
+    country: Optional[str] = Field(None, description="Optional country filter, matching ICA query parameter when available")
+    month: Optional[str] = Field(None, description="Optional month filter, e.g. 2026-08 or 202608")
+    topic_slug: Optional[str] = Field(None, description="Optional topic route slug, e.g. engineering-and-technology")
+    subtopic_slug: Optional[str] = Field(None, description="Optional subtopic route slug, e.g. artificial-intelligence")
+    city_slug: Optional[str] = Field(None, description="Optional city route slug, e.g. chicago")
+    page: int = Field(1, ge=1, description="Search page number")
+    source: Literal["auto", "api", "html", "sitemap"] = Field(
+        "auto",
+        description="auto probes possible JSON APIs, then HTML/browser, then sitemap. sitemap uses public sitemap URLs only.",
+    )
+    limit: int = Field(50, ge=1, le=1000, description="Maximum ICA events to return")
+    enrich_details: bool = Field(True, description="Fetch each event detail page and parse JSON-LD/meta fields")
+    lat: Optional[float] = Field(None, description="Latitude center for radius filtering")
+    lng: Optional[float] = Field(None, description="Longitude center for radius filtering")
+    radius_km: Optional[float] = Field(None, ge=0, description="Radius in kilometers. Requires lat/lng.")
+    geocode: bool = Field(True, description="Geocode event venue/address when the page does not expose coordinates")
+    proxy_url: Optional[str] = Field(
+        None,
+        description="Optional Playwright/Crawl4AI proxy URL, e.g. socks5://127.0.0.1:1080. Falls back to CRAWLER_PROXY_URL.",
+    )
+    persist: bool = Field(False, description="When false, only crawl and return events. When true, post to Eagle /scraper/events/ica-import")
+
+class InternationalConferenceAlertsCrawlResponse(BaseModel):
+    count: int
+    events: List[dict]
+    parse_failures: List[dict] = Field(default_factory=list)
+    diagnostics: dict = Field(default_factory=dict)
+
+class FirecrawlScraperIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    list_url: str = Field(..., description="List/search page URL to scrape with Firecrawl")
+    limit: int = Field(20, ge=1, le=100, description="Maximum detail event URLs to scrape")
+    event_url_regex: Optional[str] = Field(
+        None,
+        description="Optional regex used to pick event detail URLs from the list page. Defaults to same-domain links.",
+    )
+    include_url_patterns: List[str] = Field(
+        default_factory=list,
+        description="Optional substrings that detail URLs must contain. Empty means no include filter.",
+    )
+    exclude_url_patterns: List[str] = Field(
+        default_factory=list,
+        description="Optional substrings that detail URLs must not contain.",
+    )
+    same_domain_only: bool = Field(True, description="When true, keep only detail URLs on the same hostname as list_url")
+    enrich_details: bool = Field(True, description="Scrape event detail pages after extracting links from list_url")
+    detail_concurrency: int = Field(2, ge=1, le=5, description="Maximum concurrent Firecrawl detail scrape calls")
+    wait_for_ms: int = Field(4000, ge=0, le=30000, description="Firecrawl waitFor value for rendered pages")
+    timeout_ms: int = Field(60000, ge=10000, le=180000, description="Firecrawl scrape timeout")
+    max_age_ms: int = Field(86_400_000, ge=0, description="Firecrawl cache maxAge; 0 disables cache reuse")
+    firecrawl_proxy: Optional[str] = Field("auto", description="Firecrawl proxy option. Use null to omit.")
+    location_country: Optional[str] = Field("US", description="Firecrawl location.country option")
+    location_languages: List[str] = Field(default_factory=lambda: ["en-US"], description="Firecrawl location.languages option")
+    source_provider: str = Field("firecrawl", description="Source provider stored in metadata")
+    event_type: str = Field("Conference", description="Fallback event type when page does not expose one")
+    persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
+
 class StubHubIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
@@ -158,4 +224,3 @@ class EagleIngestResponse(BaseModel):
     failures: List[dict]
     parse_failures: List[dict] = Field(default_factory=list)
     diagnostics: dict = Field(default_factory=dict)
-

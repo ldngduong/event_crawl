@@ -1,20 +1,15 @@
-import asyncio
-import sys
+import os
 
 import uvicorn
 
 
-def proactor_loop_factory(use_subprocess: bool = False):
-    if sys.platform == "win32":
-        return asyncio.ProactorEventLoop
-    return asyncio.new_event_loop
-
-
 if __name__ == "__main__":
+    os.environ.setdefault("OPENAI_API_KEY", "dummy")
+    os.environ.setdefault("OPENROUTER_API_KEY", "dummy")
+
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8006,
-        loop="run_server:proactor_loop_factory",
-        reload=False,
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8006")),
+        reload=os.getenv("RELOAD", "true").lower() in {"1", "true", "yes"},
     )

@@ -20,6 +20,7 @@ MEETUP_BASE_URL = "https://www.meetup.com"
 MEETUP_GQL_URL = f"{MEETUP_BASE_URL}/gql2"
 MEETUP_DEFAULT_PAGE_SIZE = 30
 DEFAULT_EAGLE_API_BASE_URL = "http://localhost:3001/api/v1"
+DEFAULT_GEOCODING_URL = f"{DEFAULT_EAGLE_API_BASE_URL}/geocoding/address"
 DEFAULT_EAGLE_IMPORT_BATCH_SIZE = 10
 
 MEETUP_HEADERS = {
@@ -32,15 +33,6 @@ MEETUP_HEADERS = {
     "Content-Type": "application/json",
     "Origin": MEETUP_BASE_URL,
     "Referer": f"{MEETUP_BASE_URL}/find/",
-}
-
-MEETUP_LOCATION_PRESETS: Dict[str, Tuple[str, Optional[str], Optional[str], float, float]] = {
-    "us--ny--new york": ("New York", "NY", "us", 40.7127753, -74.0059728),
-    "new york": ("New York", "NY", "us", 40.7127753, -74.0059728),
-    "new york, ny": ("New York", "NY", "us", 40.7127753, -74.0059728),
-    "nyc": ("New York", "NY", "us", 40.7127753, -74.0059728),
-    "au--nsw--sydney": ("Sydney", "NSW", "au", -33.8688197, 151.2092955),
-    "sydney": ("Sydney", "NSW", "au", -33.8688197, 151.2092955),
 }
 
 FIND_EVENT_INFO_FRAGMENT = """
@@ -290,15 +282,23 @@ def _parse_search_url(search_url: Optional[str]) -> Dict[str, Any]:
     return {
         "keyword": unquote_plus((query.get("keywords") or [""])[0]) or None,
         "location": unquote_plus((query.get("location") or [""])[0]) or None,
+        "category_id": unquote_plus((query.get("categoryId") or [""])[0]) or None,
         "source_url": search_url,
     }
 
 
+def _first_number(*values: Any) -> Optional[float]:
+    for value in values:
+        try:
+            if value is not None and str(value).strip() != "":
+                return float(value)
+        except Exception:
+            continue
+    return None
+
+
 def _decode_location_slug(location: str) -> Tuple[str, Optional[str], Optional[str], Optional[float], Optional[float]]:
     normalized = unquote_plus(location or "").strip()
-    preset = MEETUP_LOCATION_PRESETS.get(normalized.lower())
-    if preset:
-        return preset
 
     parts = [part for part in normalized.split("--") if part]
     if len(parts) >= 3:
@@ -308,6 +308,58 @@ def _decode_location_slug(location: str) -> Tuple[str, Optional[str], Optional[s
         return city, state, country, None, None
 
     return normalized or "New York", None, None, None, None
+
+
+def _location_query(city: str, state: Optional[str], country: Optional[str]) -> str:
+    return ", ".join(part for part in (city, state, country.upper() if country else None) if part)
+
+
+async def _geocode_location(query: str) -> Tuple[Optional[Tuple[float, float]], Optional[Dict[str, Any]]]:
+    eagle_api_base_url = os.getenv("EAGLE_API_BASE_URL", DEFAULT_EAGLE_API_BASE_URL).rstrip("/")
+    geocoding_url = os.getenv("EAGLE_GEOCODING_URL") or f"{eagle_api_base_url}/geocoding/address"
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as geocoding_client:
+            response = await geocoding_client.get(
+                geocoding_url,
+                params={"q": query},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": MEETUP_HEADERS["User-Agent"],
+                },
+            )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data["data"]
+        lat = _first_number(
+            data.get("latitude") if isinstance(data, dict) else None,
+            data.get("lat") if isinstance(data, dict) else None,
+        )
+        lon = _first_number(
+            data.get("longitude") if isinstance(data, dict) else None,
+            data.get("lng") if isinstance(data, dict) else None,
+        )
+        if lat is not None and lon is not None:
+            return (lat, lon), {"geocoding_url": geocoding_url, "query": query, "status_code": response.status_code}
+        return None, {
+            "geocoding_url": geocoding_url,
+            "query": query,
+            "status_code": response.status_code,
+            "response": payload,
+            "reason": "geocoding_response_missing_lat_lon",
+        }
+    except Exception as error:
+        logger.warning("Meetup backend geocode failed query=%s error=%s", query, error)
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+        response_text = getattr(getattr(error, "response", None), "text", None)
+        return None, {
+            "geocoding_url": geocoding_url,
+            "query": query,
+            "status_code": status_code,
+            "response": response_text[:500] if isinstance(response_text, str) else None,
+            "reason": str(error),
+        }
 
 
 def _event_url_from_node(node: Dict[str, Any]) -> Optional[str]:
@@ -333,6 +385,37 @@ def _image_from_node(node: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _attendees_from_rsvps(rsvps: Dict[str, Any]) -> List[Dict[str, Any]]:
+    attendees: List[Dict[str, Any]] = []
+    edges = rsvps.get("edges")
+    if not isinstance(edges, list):
+        return attendees
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        rsvp_node = edge.get("node") if isinstance(edge.get("node"), dict) else {}
+        user = rsvp_node.get("user") if isinstance(rsvp_node.get("user"), dict) else {}
+        name = user.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        photo = user.get("memberPhoto") if isinstance(user.get("memberPhoto"), dict) else {}
+        attendees.append(
+            {
+                "id": user.get("id"),
+                "name": name.strip(),
+                "fullName": name.strip(),
+                "relationshipType": "HOST" if rsvp_node.get("isHost") else "ATTENDEE",
+                "imageUrl": photo.get("source") or photo.get("baseUrl"),
+                "meetup": {
+                    "isHost": bool(rsvp_node.get("isHost")),
+                    "memberPhoto": photo,
+                },
+            }
+        )
+    return attendees
+
+
 def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     name = node.get("title")
     if not isinstance(name, str) or not name.strip():
@@ -344,6 +427,10 @@ def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[s
     social = node.get("socialProofInsights") if isinstance(node.get("socialProofInsights"), dict) else {}
     rsvps = node.get("rsvps") if isinstance(node.get("rsvps"), dict) else {}
     event_url = _event_url_from_node(node)
+    image_url = _image_from_node(node)
+    organizer_url = f"{MEETUP_BASE_URL}/{group.get('urlname')}/" if group.get("urlname") else None
+    expected_attendance = rsvps.get("totalCount") or social.get("totalInterestedUsers") or node.get("maxTickets")
+    attendees = _attendees_from_rsvps(rsvps)
     location = {
         "@type": "Place",
         "name": venue.get("name"),
@@ -363,18 +450,26 @@ def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[s
         "title": name.strip(),
         "url": event_url,
         "source_url": event_url,
+        "sourceUrl": event_url,
         "startDate": node.get("dateTime"),
         "endDate": node.get("endTime"),
         "timezone": group.get("timezone"),
         "eventType": node.get("eventType"),
+        "industry": node.get("eventType"),
         "description": _strip_html(node.get("description")),
-        "image": _image_from_node(node),
+        "image": image_url,
+        "eventImageUrl": image_url,
+        "expectedAttendance": expected_attendance,
+        "attendeeCount": expected_attendance,
+        "attendees": attendees,
         "location": location,
         "organizer": {
             "@type": "Organization",
             "name": group.get("name"),
-            "url": f"{MEETUP_BASE_URL}/{group.get('urlname')}/" if group.get("urlname") else None,
+            "url": organizer_url,
         },
+        "organizerName": group.get("name"),
+        "organizerWebsite": organizer_url,
         "offers": {
             "price": fee.get("amount"),
             "priceCurrency": fee.get("currency"),
@@ -384,7 +479,9 @@ def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[s
         "meetup": {
             "source": "search",
             "group": group,
+            "venue": venue,
             "rsvpsTotalCount": rsvps.get("totalCount"),
+            "attendeeCount": expected_attendance,
             "maxTickets": node.get("maxTickets"),
             "socialProofInsights": social,
             "metadata": metadata or {},
@@ -407,15 +504,20 @@ def _compact_meetup_json_ld_event(data: Dict[str, Any], source_url: str) -> Dict
         "title": data.get("name"),
         "url": _clean_url(data.get("url")) or _clean_url(source_url),
         "source_url": _clean_url(data.get("url")) or _clean_url(source_url),
+        "sourceUrl": _clean_url(data.get("url")) or _clean_url(source_url),
         "description": _strip_html(data.get("description")),
         "startDate": data.get("startDate"),
         "endDate": data.get("endDate"),
         "eventStatus": data.get("eventStatus"),
         "eventAttendanceMode": data.get("eventAttendanceMode"),
         "image": image,
+        "eventImageUrl": image,
         "location": location,
         "organizer": organizer,
+        "organizerName": organizer.get("name"),
+        "organizerWebsite": organizer.get("url"),
         "eventType": "Meetup",
+        "industry": "Meetup",
         "categories": ["Meetup"],
         "meetup": {
             "source": "json_ld_detail",
@@ -478,19 +580,12 @@ async def _search_meetup_api_events(
     lat: Optional[float],
     lon: Optional[float],
     radius: Optional[float],
+    category_id: Optional[str],
     limit: int,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     city, state, country, preset_lat, preset_lon = _decode_location_slug(location)
     latitude = lat if lat is not None else preset_lat
     longitude = lon if lon is not None else preset_lon
-    if latitude is None or longitude is None:
-        return [], [
-            {
-                "reason": "missing_lat_lon_for_meetup_search",
-                "location": location,
-                "hint": "Pass lat/lon or use a known Meetup slug such as us--ny--New York.",
-            }
-        ]
 
     events: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
@@ -500,6 +595,25 @@ async def _search_meetup_api_events(
     today = datetime.now(timezone.utc).date().isoformat()
 
     async with httpx.AsyncClient(timeout=45, headers=MEETUP_HEADERS, follow_redirects=True) as client:
+        if latitude is None or longitude is None:
+            query = _location_query(city, state, country)
+            coords, geocoding_diagnostics = await _geocode_location(query)
+            if coords:
+                latitude, longitude = coords
+        else:
+            geocoding_diagnostics = None
+
+        if latitude is None or longitude is None:
+            return [], [
+                {
+                    "reason": "missing_lat_lon_for_meetup_search",
+                    "location": location,
+                    "resolved_location_query": _location_query(city, state, country),
+                    "geocoding": geocoding_diagnostics,
+                    "hint": "Backend geocoding must return latitude/longitude for this Meetup location.",
+                }
+            ]
+
         while len(events) < limit:
             payload = {
                 "operationName": "eventSearchWithSeries",
@@ -513,7 +627,7 @@ async def _search_meetup_api_events(
                     "radius": radius,
                     "isHappeningNow": None,
                     "isStartingSoon": None,
-                    "categoryId": None,
+                    "categoryId": category_id,
                     "topicCategoryId": None,
                     "city": city,
                     "state": state,
@@ -606,6 +720,7 @@ async def crawl_meetup_events_with_diagnostics(
     parsed = _parse_search_url(search_url)
     keyword = parsed.get("keyword") or keyword
     location = parsed.get("location") or location
+    category_id = parsed.get("category_id")
     parse_failures: List[Dict[str, Any]] = []
 
     if source == "html":
@@ -618,6 +733,7 @@ async def crawl_meetup_events_with_diagnostics(
         lat=lat,
         lon=lon,
         radius=radius,
+        category_id=category_id,
         limit=limit,
     )
     parse_failures.extend(failures)
