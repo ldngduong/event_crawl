@@ -6,6 +6,26 @@ Hệ thống sử dụng **Crawl4AI** để thu thập dữ liệu thô và **Op
 
 ---
 
+## Quickstart hiện tại
+
+```bash
+./run_dev.sh
+```
+
+Server chạy mặc định ở `http://localhost:8006`.
+
+InternationalConferenceAlerts preview:
+
+```bash
+curl "http://localhost:8006/international-conference-alerts/events?search_url=https%3A%2F%2Finternationalconferencealerts.com%2Fconferences%3Fq%3Dtech%26country%3D%26month%3D&limit=10&source=auto"
+```
+
+Radius filter dùng `lat`, `lng`, `radius_km`; nếu event chưa có tọa độ, crawler sẽ thử gọi `EAGLE_GEOCODING_URL` hoặc mặc định `http://localhost:3001/api/v1/geocoding/address`.
+
+```bash
+curl "http://localhost:8006/international-conference-alerts/events?q=tech&limit=10&lat=40.7128&lng=-74.0060&radius_km=100"
+```
+
 ## Yêu cầu hệ thống
 
 - Python 3.11 trở lên
