@@ -431,9 +431,13 @@ def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[s
     organizer_url = f"{MEETUP_BASE_URL}/{group.get('urlname')}/" if group.get("urlname") else None
     expected_attendance = rsvps.get("totalCount") or social.get("totalInterestedUsers") or node.get("maxTickets")
     attendees = _attendees_from_rsvps(rsvps)
+    venue_name = venue.get("name")
+    venue_parts = [venue_name, venue.get("address"), venue.get("city"), venue.get("state"), venue.get("country")]
+    location_text = ", ".join(str(p) for p in venue_parts if p) or None
+
     location = {
         "@type": "Place",
-        "name": venue.get("name"),
+        "name": venue_name,
         "address": {
             "@type": "PostalAddress",
             "streetAddress": venue.get("address"),
@@ -463,6 +467,7 @@ def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[s
         "attendeeCount": expected_attendance,
         "attendees": attendees,
         "location": location,
+        "locationText": location_text,
         "organizer": {
             "@type": "Organization",
             "name": group.get("name"),
@@ -497,6 +502,11 @@ def _compact_meetup_json_ld_event(data: Dict[str, Any], source_url: str) -> Dict
     if isinstance(image, list):
         image = image[0] if image else None
 
+    loc_name = location.get("name") if isinstance(location.get("name"), str) else None
+    addr = location.get("address") if isinstance(location.get("address"), dict) else {}
+    addr_parts = [addr.get(k) for k in ("streetAddress", "addressLocality", "addressRegion", "addressCountry") if addr.get(k)]
+    location_text = loc_name or (", ".join(addr_parts) if addr_parts else None)
+
     return {
         "@type": "Event",
         "id": source_url.rstrip("/").split("/")[-1],
@@ -513,6 +523,7 @@ def _compact_meetup_json_ld_event(data: Dict[str, Any], source_url: str) -> Dict
         "image": image,
         "eventImageUrl": image,
         "location": location,
+        "locationText": location_text,
         "organizer": organizer,
         "organizerName": organizer.get("name"),
         "organizerWebsite": organizer.get("url"),

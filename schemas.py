@@ -189,6 +189,32 @@ class FirecrawlScraperIngestRequest(BaseModel):
     event_type: str = Field("Conference", description="Fallback event type when page does not expose one")
     persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
 
+class TenTimesIngestRequest(BaseModel):
+    organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID")
+    workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    list_url: str = Field(
+        "https://10times.com/newyork-us/conferences",
+        description="10times list URL, e.g. https://10times.com/newyork-us/conferences",
+    )
+    source: Literal["auto", "html", "brightdata"] = Field(
+        "auto",
+        description="auto tries direct HTML first, then Bright Data when 10times returns the human-check wall.",
+    )
+    limit: int = Field(50, ge=1, le=500, description="Maximum events to return")
+    pages: int = Field(1, ge=1, le=20, description="List pages to crawl. Page 2+ uses 10times AJAX scroll endpoint.")
+    enrich_details: bool = Field(True, description="Fetch each detail URL and merge JSON-LD/detail metadata")
+    cookie: Optional[str] = Field(
+        None,
+        description="Optional Cookie header copied from a logged-in browser session when direct/Bright Data hits the human-check wall.",
+    )
+    persist: bool = Field(False, description="When false, only crawl and return events without writing Eagle DB")
+
+class TenTimesCrawlResponse(BaseModel):
+    count: int
+    events: List[dict]
+    parse_failures: List[dict] = Field(default_factory=list)
+    diagnostics: dict = Field(default_factory=dict)
+
 class StubHubIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")

@@ -23,6 +23,8 @@ from schemas import (
     LumaIngestRequest,
     MeetupIngestRequest,
     StubHubIngestRequest,
+    TenTimesCrawlResponse,
+    TenTimesIngestRequest,
     UniverseIngestRequest,
     WeddingInfo,
     WeddingList,
@@ -60,6 +62,10 @@ from firecrawl_scraper import (
     crawl_firecrawl_events_with_diagnostics,
     ingest_firecrawl_events_to_eagle,
 )
+from ten_times_crawler import (
+    crawl_ten_times_events_with_diagnostics,
+    ingest_ten_times_events_to_eagle,
+)
 import httpx
 import uvicorn
 import logging
@@ -88,6 +94,7 @@ async def root():
             "stubhub_ingest": "/stubhub/events/ingest",
             "discover_events_ingest": "/discover/events/ingest",
             "firecrawl_scraper_ingest": "/firecrawl-scraper/events/ingest",
+            "ten_times_ingest": "/ten-times/events/ingest",
             "international_conference_alerts": "/international-conference-alerts/events",
             "international_conference_alerts_ingest": "/international-conference-alerts/events/ingest",
         }
@@ -539,6 +546,104 @@ async def firecrawl_scraper_ingest_usage():
             "event_url_regex": "internationalconferencealerts\\.com/event-",
             "event_type": "Conference",
             "source_provider": "international_conference_alerts_firecrawl",
+            "persist": False,
+        },
+    }
+
+
+@app.get("/ten-times/events", response_model=TenTimesCrawlResponse)
+async def get_ten_times_events(
+    list_url: str = Query(
+        "https://10times.com/newyork-us/conferences",
+        description="10times list URL, e.g. https://10times.com/newyork-us/conferences",
+    ),
+    source: str = Query("auto", pattern="^(auto|html|brightdata)$", description="Crawl source"),
+    limit: int = Query(50, ge=1, le=500, description="Max events to return"),
+    pages: int = Query(1, ge=1, le=20, description="List pages to crawl"),
+    enrich_details: bool = Query(True, description="Fetch detail pages"),
+    cookie: Optional[str] = Query(None, description="Optional Cookie header copied from a logged-in browser session"),
+):
+    """
+    Crawl 10times list/detail HTML.
+    Direct HTML is tried first; Bright Data is used when source=auto and 10times
+    returns its human-check wall.
+    """
+    logger.info(
+        "Received 10times crawl list_url='%s' source=%s limit=%s pages=%s enrich_details=%s",
+        list_url,
+        source,
+        limit,
+        pages,
+        enrich_details,
+    )
+    try:
+        crawl_result = await crawl_ten_times_events_with_diagnostics(
+            list_url=list_url,
+            source=source,  # type: ignore[arg-type]
+            limit=limit,
+            pages=pages,
+            enrich_details=enrich_details,
+            cookie=cookie,
+        )
+        return {
+            "count": len(crawl_result["events"]),
+            "events": crawl_result["events"],
+            "parse_failures": crawl_result["parse_failures"],
+            "diagnostics": crawl_result.get("diagnostics", {}),
+        }
+    except Exception as e:
+        logger.error(f"Error crawling 10times: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ten-times/events/ingest", response_model=EagleIngestResponse)
+async def ingest_ten_times_events(request: TenTimesIngestRequest):
+    """
+    Crawl 10times list/detail HTML, then optionally import into Eagle via generic importer.
+    Set persist=false to preview mapped events first.
+    """
+    logger.info(
+        "Received 10times ingest list_url='%s' source=%s limit=%s pages=%s persist=%s",
+        request.list_url,
+        request.source,
+        request.limit,
+        request.pages,
+        request.persist,
+    )
+    try:
+        crawl_result = await crawl_ten_times_events_with_diagnostics(
+            list_url=request.list_url,
+            source=request.source,
+            limit=request.limit,
+            pages=request.pages,
+            enrich_details=request.enrich_details,
+            cookie=request.cookie,
+        )
+        return await ingest_ten_times_events_to_eagle(
+            organization_id=request.organization_id,
+            workspace_id=request.workspace_id,
+            events=crawl_result["events"],
+            parse_failures=crawl_result["parse_failures"],
+            diagnostics=crawl_result.get("diagnostics", {}),
+            persist=request.persist,
+        )
+    except Exception as e:
+        logger.error(f"Error ingesting 10times events: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ten-times/events/ingest")
+async def ten_times_ingest_usage():
+    return {
+        "message": "Use POST /ten-times/events/ingest to crawl 10times list/detail HTML and optionally import into Eagle.",
+        "behavior": "source=auto fetches direct HTML first, then Bright Data when the direct response is 403/human-check.",
+        "note": "If both direct and Bright Data return the 10times human-check wall, pass a Cookie header copied from a logged-in browser session.",
+        "example_body": {
+            "list_url": "https://10times.com/newyork-us/conferences",
+            "source": "auto",
+            "limit": 10,
+            "pages": 2,
+            "enrich_details": True,
             "persist": False,
         },
     }

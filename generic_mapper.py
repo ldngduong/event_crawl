@@ -2,7 +2,7 @@ import os
 import httpx
 from typing import List, Dict, Any, Optional
 
-DEFAULT_EAGLE_API_BASE_URL = "http://localhost:3000/api/v1"
+DEFAULT_EAGLE_API_BASE_URL = "http://localhost:3001/api/v1"
 DEFAULT_EAGLE_IMPORT_BATCH_SIZE = 50
 
 def map_to_generic_event(raw_event: Dict[str, Any], source_provider: str) -> Dict[str, Any]:
@@ -34,7 +34,7 @@ def map_to_generic_event(raw_event: Dict[str, Any], source_provider: str) -> Dic
     country = address.get("addressCountry") or raw_event.get("country")
     
     occurrence = {
-        "locationText": location.get("name") or location.get("address") or raw_event.get("locationText"),
+        "locationText": location.get("name") or raw_event.get("locationText"),
         "latitude": raw_event.get("lat") or raw_event.get("latitude") or location.get("latitude"),
         "longitude": raw_event.get("lng") or raw_event.get("longitude") or location.get("longitude"),
         "venueName": location.get("name"),
@@ -121,7 +121,9 @@ async def ingest_generic_events_to_eagle(
             try:
                 response = await client.post(endpoint_url, json=payload)
                 response.raise_for_status()
-                eagle_response = response.json()
+                raw_response = response.json()
+                # Backend wraps response in {status_code, message, error, data: {...}}
+                eagle_response = raw_response.get("data") or raw_response
                 results.append(
                     {
                         **batch_meta,
