@@ -15,13 +15,19 @@ class GenericOccurrenceDict(TypedDict, total=False):
     expectedAttendance: Optional[int]
 
 class GenericAttendeeDict(TypedDict, total=False):
+    name: Optional[str]
     title: Optional[str]
     fullName: Optional[str]
     linkedInUrl: Optional[str]
+    email: Optional[str]
+    phone: Optional[str]
+    imageUrl: Optional[str]
+    contactPoints: Optional[List[Dict[str, Any]]]
     metadataJson: Optional[Dict[str, Any]]
-    organizationName: str
+    organizationName: Optional[str]
     provider: Optional[str]
     relationshipType: Optional[str]
+    confidence: Optional[float]
 
 class GenericCompanyDict(TypedDict, total=False):
     name: Optional[str]
@@ -29,11 +35,15 @@ class GenericCompanyDict(TypedDict, total=False):
     industry: Optional[str]
     relationshipType: Optional[str]
     headquarterCountry: Optional[str]
+    headquartersCountry: Optional[str]
     sizeBand: Optional[str]
     websiteUrl: Optional[str]
     type: Optional[str]
     roles: Optional[str]
     linkedInUrl: Optional[str]
+    sameDomain: Optional[str]
+    confidence: Optional[float]
+    locations: Optional[List[Dict[str, Any]]]
     metadataJson: Optional[Dict[str, Any]]
 
 class GenericMappedEventDict(TypedDict, total=False):
@@ -44,6 +54,7 @@ class GenericMappedEventDict(TypedDict, total=False):
     city: Optional[str]
     country: Optional[str]
     eventType: Optional[str]
+    category: Optional[str]
     organizerName: Optional[str]
     organizerWebsite: Optional[str]
     organizerContact: Optional[str]
@@ -56,17 +67,6 @@ class GenericMappedEventDict(TypedDict, total=False):
     occurrence: GenericOccurrenceDict
     companies: Optional[List[GenericCompanyDict]]
     metadataJson: Optional[Dict[str, Any]]
-
-class WeddingInfo(BaseModel):
-    couple_names: Optional[str] = Field(None, description="Names of the couple getting married")
-    date: Optional[str] = Field(None, description="Date of the wedding")
-    time: Optional[str] = Field(None, description="Time of the wedding")
-    venue: Optional[str] = Field(None, description="Name and address of the wedding venue")
-    location: Optional[str] = Field(None, description="City or region where the wedding takes place")
-    source_url: str = Field(..., description="URL where the information was found")
-
-class WeddingList(BaseModel):
-    weddings: List[WeddingInfo]
 
 class ConferankIngestRequest(BaseModel):
     location: Optional[str] = Field(default=None, description="Filter by location (e.g. Las Vegas)")

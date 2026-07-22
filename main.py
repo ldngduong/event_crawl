@@ -27,10 +27,7 @@ from schemas import (
     TenTimesCrawlResponse,
     TenTimesIngestRequest,
     UniverseIngestRequest,
-    WeddingInfo,
-    WeddingList,
 )
-from crawler import search_wedding_urls, extract_wedding_data
 from humanitix_crawler import (
     crawl_humanitix_events_with_diagnostics,
     ingest_humanitix_events_to_eagle,
@@ -82,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Eagle Event Crawler API",
-    description="Crawls public event sources and wedding websites using Crawl4AI, JSON-LD, and source-specific APIs.",
+    description="Crawls public event sources using Crawl4AI, JSON-LD, and source-specific APIs.",
     version="1.0.0"
 )
 
@@ -91,7 +88,6 @@ async def root():
     return {
         "message": "Crawler API is running.",
         "endpoints": {
-            "weddings": "/weddings/{location}",
             "humanitix_events": "/humanitix/events/{location}",
             "humanitix_ingest": "/humanitix/events/ingest",
             "universe_ingest": "/universe/events/ingest",
@@ -176,36 +172,6 @@ async def debug_fetch_international_conference_alerts(
         "body_length": len(body),
         "json": parsed_json,
     }
-
-@app.get("/weddings/{location}", response_model=WeddingList)
-async def get_weddings(
-    location: str, 
-    years: str = Query("2026..2028", description="Year range, e.g., 2026..2028"),
-    limit: int = Query(10, description="Max wedding pages to crawl")
-):
-    """
-    Search and crawl wedding websites for a specific location.
-    """
-    logger.info(f"Received request for weddings in {location} for years {years}")
-    try:
-        # 1. Search for URLs
-        urls = await search_wedding_urls(location, years)
-        if not urls:
-            logger.warning(f"No URLs found for location: {location}")
-            return {"weddings": []}
-        
-        # 2. Limit URLs
-        urls_to_crawl = urls[:limit * 4]
-        logger.info(f"Proceeding to crawl {len(urls_to_crawl)} URLs")
-        
-        # 3. Extract data
-        weddings = await extract_wedding_data(urls_to_crawl, location=location)
-        logger.info(f"Successfully extracted {len(weddings)} weddings")
-        
-        return {"weddings": weddings}
-    except Exception as e:
-        logger.error(f"Error processing request: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/humanitix/events/ingest", response_model=EagleIngestResponse)
 async def ingest_humanitix_events(request: HumanitixIngestRequest):

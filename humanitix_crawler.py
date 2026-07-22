@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
 
 from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericMappedEventDict, GenericOccurrenceDict
 
 os.environ.setdefault(
     "CRAWL4_AI_BASE_DIRECTORY",
@@ -592,6 +593,18 @@ def _merge_humanitix_events(base: Dict[str, Any], detail: Dict[str, Any]) -> Dic
         if isinstance(base_value, dict) and isinstance(detail_value, dict):
             merged[key] = {**base_value, **detail_value}
 
+    base_location = base.get("location")
+    detail_location = detail.get("location")
+    if isinstance(base_location, dict) and isinstance(detail_location, dict):
+        base_address = base_location.get("address")
+        detail_address = detail_location.get("address")
+        if isinstance(base_address, dict) and isinstance(detail_address, dict):
+            merged["location"] = {
+                **base_location,
+                **detail_location,
+                "address": {**base_address, **detail_address},
+            }
+
     if base.get("id") and not detail.get("id"):
         merged["id"] = base["id"]
     if base.get("startDate") and not detail.get("startDate"):
@@ -600,6 +613,125 @@ def _merge_humanitix_events(base: Dict[str, Any], detail: Dict[str, Any]) -> Dic
         merged["endDate"] = base["endDate"]
 
     return {key: value for key, value in merged.items() if value not in (None, "", [], {})}
+
+
+def _read_string(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        trimmed = value.strip()
+        return trimmed or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def _first_string(*values: Any) -> Optional[str]:
+    for value in values:
+        candidate = _read_string(value)
+        if candidate:
+            return candidate
+    return None
+
+
+def _first_image_url(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return _read_string(value)
+    if isinstance(value, list):
+        for item in value:
+            candidate = _first_image_url(item)
+            if candidate:
+                return candidate
+    if isinstance(value, dict):
+        return _first_string(value.get("url"), value.get("contentUrl"), value.get("src"))
+    return None
+
+
+def _country_from_address(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        return _first_string(value.get("addressCountry"), value.get("name"), value.get("identifier"))
+    return _read_string(value)
+
+
+def _city_from_address_text(value: Any) -> Optional[str]:
+    text = _read_string(value)
+    if not text:
+        return None
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if len(parts) < 2:
+        return None
+    first = parts[0]
+    if re.match(r"^\d+\b", first):
+        return None
+    return first
+
+
+def _humanitix_event_type(raw_event: Dict[str, Any]) -> str:
+    event_type = _first_string(raw_event.get("eventType"), raw_event.get("type"), raw_event.get("category"))
+    if event_type and event_type.lower() != "event":
+        return event_type
+    return "Conference"
+
+
+def _map_humanitix_event_to_generic(raw_event: Dict[str, Any]) -> Optional[GenericMappedEventDict]:
+    name = _first_string(raw_event.get("name"), raw_event.get("title"))
+    if not name:
+        return None
+
+    location = raw_event.get("location") if isinstance(raw_event.get("location"), dict) else {}
+    address = location.get("address") if isinstance(location.get("address"), dict) else {}
+    humanitix = raw_event.get("humanitix") if isinstance(raw_event.get("humanitix"), dict) else {}
+    event_location = humanitix.get("eventLocation") if isinstance(humanitix.get("eventLocation"), dict) else {}
+    organizer = raw_event.get("organizer") if isinstance(raw_event.get("organizer"), dict) else {}
+
+    street_address = _first_string(address.get("streetAddress"), event_location.get("address"))
+    city = _first_string(
+        address.get("addressLocality"),
+        raw_event.get("city"),
+        event_location.get("city"),
+        _city_from_address_text(street_address),
+    )
+    country = _first_string(
+        _country_from_address(address.get("addressCountry")),
+        raw_event.get("country"),
+        event_location.get("addressCountry"),
+        humanitix.get("location"),
+    )
+    venue_name = _first_string(location.get("name"), event_location.get("venueName"))
+
+    occurrence: GenericOccurrenceDict = {
+        "locationText": _first_string(venue_name, street_address, raw_event.get("locationText")),
+        "venueName": venue_name,
+        "streetAddress": street_address,
+        "city": city,
+        "region": _first_string(address.get("addressRegion"), event_location.get("addressRegion")),
+        "postalCode": _first_string(address.get("postalCode"), event_location.get("postalCode")),
+        "country": country,
+        "timezone": _first_string(raw_event.get("timezone"), humanitix.get("timezone")),
+    }
+    occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
+
+    metadata = {
+        **raw_event,
+        "sourceProvider": "humanitix",
+    }
+
+    event: GenericMappedEventDict = {
+        "name": name,
+        "sourceUrl": _first_string(raw_event.get("url"), raw_event.get("source_url"), raw_event.get("sourceUrl")),
+        "startAt": raw_event.get("startDate"),
+        "endAt": raw_event.get("endDate"),
+        "city": city,
+        "country": country,
+        "eventType": _humanitix_event_type(raw_event),
+        "industry": _first_string(raw_event.get("industry"), raw_event.get("category")),
+        "organizerName": _first_string(organizer.get("name"), raw_event.get("organizerName")),
+        "organizerWebsite": _first_string(raw_event.get("organizerWebsite"), organizer.get("url"), organizer.get("sameAs")),
+        "eventImageUrl": _first_image_url(raw_event.get("eventImageUrl") or raw_event.get("image")),
+        "description": _read_string(raw_event.get("description")),
+        "sourceProvider": "humanitix",
+        "occurrence": occurrence,
+        "metadataJson": metadata,
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
 
 
 async def search_humanitix_urls(
@@ -844,8 +976,14 @@ async def crawl_humanitix_events_with_diagnostics(
         key = event.get("id") or f"{event.get('url')}:{event.get('startDate')}"
         deduped[str(key)] = event
 
+    mapped_events: List[GenericMappedEventDict] = []
+    for event in deduped.values():
+        mapped_event = _map_humanitix_event_to_generic(event)
+        if mapped_event:
+            mapped_events.append(mapped_event)
+
     return {
-        "events": list(deduped.values())[:limit],
+        "events": mapped_events[:limit],
         "parse_failures": parse_failures,
     }
 
@@ -865,4 +1003,5 @@ async def ingest_humanitix_events_to_eagle(
         source_provider="humanitix",
         parse_failures=parse_failures,
         persist=persist,
+        already_mapped=True,
     )
