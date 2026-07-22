@@ -72,9 +72,13 @@ async def ingest_generic_events_to_eagle(
     source_provider: str,
     parse_failures: Optional[List[Dict[str, Any]]] = None,
     persist: bool = False,
+    already_mapped: bool = False,
 ) -> Dict[str, Any]:
     
-    mapped_events = [map_to_generic_event(e, source_provider) for e in events]
+    if already_mapped:
+        mapped_events = events
+    else:
+        mapped_events = [map_to_generic_event(e, source_provider) for e in events]
     
     eagle_api_base_url = os.getenv("EAGLE_API_BASE_URL", DEFAULT_EAGLE_API_BASE_URL).rstrip("/")
     endpoint_url = f"{eagle_api_base_url}/scraper/events/generic-import"

@@ -1,5 +1,61 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, TypedDict, Dict, Any
+
+class GenericOccurrenceDict(TypedDict, total=False):
+    locationText: Optional[str]
+    latitude: Optional[float]
+    longitude: Optional[float]
+    venueName: Optional[str]
+    streetAddress: Optional[str]
+    city: Optional[str]
+    region: Optional[str]
+    postalCode: Optional[str]
+    country: Optional[str]
+    timezone: Optional[str]
+    expectedAttendance: Optional[int]
+
+class GenericAttendeeDict(TypedDict, total=False):
+    title: Optional[str]
+    fullName: Optional[str]
+    linkedInUrl: Optional[str]
+    metadataJson: Optional[Dict[str, Any]]
+    organizationName: str
+    provider: Optional[str]
+    relationshipType: Optional[str]
+
+class GenericCompanyDict(TypedDict, total=False):
+    name: Optional[str]
+    domain: Optional[str]
+    industry: Optional[str]
+    relationshipType: Optional[str]
+    headquarterCountry: Optional[str]
+    sizeBand: Optional[str]
+    websiteUrl: Optional[str]
+    type: Optional[str]
+    roles: Optional[str]
+    linkedInUrl: Optional[str]
+    metadataJson: Optional[Dict[str, Any]]
+
+class GenericMappedEventDict(TypedDict, total=False):
+    name: str
+    sourceUrl: Optional[str]
+    startAt: Optional[str]
+    endAt: Optional[str]
+    city: Optional[str]
+    country: Optional[str]
+    eventType: Optional[str]
+    organizerName: Optional[str]
+    organizerWebsite: Optional[str]
+    organizerContact: Optional[str]
+    eventImageUrl: Optional[str]
+    industry: Optional[str]
+    expectedAttendance: Optional[int]
+    description: Optional[str]
+    sourceProvider: str
+    attendees: Optional[List[GenericAttendeeDict]]
+    occurrence: GenericOccurrenceDict
+    companies: Optional[List[GenericCompanyDict]]
+    metadataJson: Optional[Dict[str, Any]]
 
 class WeddingInfo(BaseModel):
     couple_names: Optional[str] = Field(None, description="Names of the couple getting married")

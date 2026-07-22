@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote_plus, urljoin, urlparse
 
 from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericMappedEventDict, GenericAttendeeDict, GenericOccurrenceDict
 
 import httpx
 from bs4 import BeautifulSoup
@@ -385,8 +386,8 @@ def _image_from_node(node: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _attendees_from_rsvps(rsvps: Dict[str, Any]) -> List[Dict[str, Any]]:
-    attendees: List[Dict[str, Any]] = []
+def _attendees_from_rsvps(rsvps: Dict[str, Any]) -> List[GenericAttendeeDict]:
+    attendees: List[GenericAttendeeDict] = []
     edges = rsvps.get("edges")
     if not isinstance(edges, list):
         return attendees
@@ -402,21 +403,22 @@ def _attendees_from_rsvps(rsvps: Dict[str, Any]) -> List[Dict[str, Any]]:
         photo = user.get("memberPhoto") if isinstance(user.get("memberPhoto"), dict) else {}
         attendees.append(
             {
-                "id": user.get("id"),
-                "name": name.strip(),
                 "fullName": name.strip(),
                 "relationshipType": "HOST" if rsvp_node.get("isHost") else "ATTENDEE",
-                "imageUrl": photo.get("source") or photo.get("baseUrl"),
-                "meetup": {
-                    "isHost": bool(rsvp_node.get("isHost")),
-                    "memberPhoto": photo,
-                },
+                "metadataJson": {
+                    "id": user.get("id"),
+                    "imageUrl": photo.get("source") or photo.get("baseUrl"),
+                    "meetup": {
+                        "isHost": bool(rsvp_node.get("isHost")),
+                        "memberPhoto": photo,
+                    },
+                }
             }
         )
     return attendees
 
 
-def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> Optional[GenericMappedEventDict]:
     name = node.get("title")
     if not isinstance(name, str) or not name.strip():
         return None
@@ -435,67 +437,59 @@ def _compact_meetup_search_event(node: Dict[str, Any], metadata: Optional[Dict[s
     venue_parts = [venue_name, venue.get("address"), venue.get("city"), venue.get("state"), venue.get("country")]
     location_text = ", ".join(str(p) for p in venue_parts if p) or None
 
-    location = {
-        "@type": "Place",
-        "name": venue_name,
-        "address": {
-            "@type": "PostalAddress",
-            "streetAddress": venue.get("address"),
-            "addressLocality": venue.get("city"),
-            "addressRegion": venue.get("state"),
-            "addressCountry": venue.get("country"),
-        },
-    }
-
-    event = {
-        "@type": "Event",
-        "id": node.get("id"),
-        "name": name.strip(),
-        "title": name.strip(),
-        "url": event_url,
-        "source_url": event_url,
-        "sourceUrl": event_url,
-        "startDate": node.get("dateTime"),
-        "endDate": node.get("endTime"),
+    occurrence: GenericOccurrenceDict = {
+        "locationText": location_text,
+        "venueName": venue_name,
+        "streetAddress": venue.get("address"),
+        "city": venue.get("city"),
+        "region": venue.get("state"),
+        "country": venue.get("country"),
         "timezone": group.get("timezone"),
+        "expectedAttendance": expected_attendance,
+    }
+    occurrence = {k: v for k, v in occurrence.items() if v is not None}
+
+    event: GenericMappedEventDict = {
+        "name": name.strip(),
+        "sourceUrl": event_url,
+        "startAt": node.get("dateTime"),
+        "endAt": node.get("endTime"),
+        "city": venue.get("city"),
+        "country": venue.get("country"),
         "eventType": node.get("eventType"),
         "industry": node.get("eventType"),
-        "description": _strip_html(node.get("description")),
-        "image": image_url,
-        "eventImageUrl": image_url,
-        "expectedAttendance": expected_attendance,
-        "attendeeCount": expected_attendance,
-        "attendees": attendees,
-        "location": location,
-        "locationText": location_text,
-        "organizer": {
-            "@type": "Organization",
-            "name": group.get("name"),
-            "url": organizer_url,
-        },
         "organizerName": group.get("name"),
         "organizerWebsite": organizer_url,
-        "offers": {
-            "price": fee.get("amount"),
-            "priceCurrency": fee.get("currency"),
-            "accepts": fee.get("accepts"),
-        },
-        "categories": [node.get("eventType")] if node.get("eventType") else [],
-        "meetup": {
-            "source": "search",
-            "group": group,
-            "venue": venue,
-            "rsvpsTotalCount": rsvps.get("totalCount"),
-            "attendeeCount": expected_attendance,
-            "maxTickets": node.get("maxTickets"),
-            "socialProofInsights": social,
-            "metadata": metadata or {},
-        },
+        "eventImageUrl": image_url,
+        "expectedAttendance": expected_attendance,
+        "description": _strip_html(node.get("description")),
+        "sourceProvider": "meetup",
+        "attendees": attendees,
+        "occurrence": occurrence,
+        "metadataJson": {
+            "categories": [node.get("eventType")] if node.get("eventType") else [],
+            "id": node.get("id"),
+            "offers": {
+                "price": fee.get("amount"),
+                "priceCurrency": fee.get("currency"),
+                "accepts": fee.get("accepts"),
+            },
+            "meetup": {
+                "source": "search",
+                "group": group,
+                "venue": venue,
+                "rsvpsTotalCount": rsvps.get("totalCount"),
+                "attendeeCount": expected_attendance,
+                "maxTickets": node.get("maxTickets"),
+                "socialProofInsights": social,
+                "metadata": metadata or {},
+            }
+        }
     }
-    return {key: value for key, value in event.items() if value not in (None, "", [], {})}
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
 
 
-def _compact_meetup_json_ld_event(data: Dict[str, Any], source_url: str) -> Dict[str, Any]:
+def _compact_meetup_json_ld_event(data: Dict[str, Any], source_url: str) -> GenericMappedEventDict:
     location = data.get("location") if isinstance(data.get("location"), dict) else {}
     organizer = data.get("organizer") if isinstance(data.get("organizer"), dict) else {}
     image = data.get("image")
@@ -507,43 +501,59 @@ def _compact_meetup_json_ld_event(data: Dict[str, Any], source_url: str) -> Dict
     addr_parts = [addr.get(k) for k in ("streetAddress", "addressLocality", "addressRegion", "addressCountry") if addr.get(k)]
     location_text = loc_name or (", ".join(addr_parts) if addr_parts else None)
 
-    return {
-        "@type": "Event",
-        "id": source_url.rstrip("/").split("/")[-1],
-        "name": data.get("name"),
-        "title": data.get("name"),
-        "url": _clean_url(data.get("url")) or _clean_url(source_url),
-        "source_url": _clean_url(data.get("url")) or _clean_url(source_url),
-        "sourceUrl": _clean_url(data.get("url")) or _clean_url(source_url),
-        "description": _strip_html(data.get("description")),
-        "startDate": data.get("startDate"),
-        "endDate": data.get("endDate"),
-        "eventStatus": data.get("eventStatus"),
-        "eventAttendanceMode": data.get("eventAttendanceMode"),
-        "image": image,
-        "eventImageUrl": image,
-        "location": location,
+    occurrence: GenericOccurrenceDict = {
         "locationText": location_text,
-        "organizer": organizer,
-        "organizerName": organizer.get("name"),
-        "organizerWebsite": organizer.get("url"),
+        "venueName": loc_name,
+        "streetAddress": addr.get("streetAddress"),
+        "city": addr.get("addressLocality"),
+        "region": addr.get("addressRegion"),
+        "country": addr.get("addressCountry"),
+    }
+    occurrence = {k: v for k, v in occurrence.items() if v is not None}
+
+    event: GenericMappedEventDict = {
+        "name": data.get("name") or "",
+        "sourceUrl": _clean_url(data.get("url")) or _clean_url(source_url),
+        "startAt": data.get("startDate"),
+        "endAt": data.get("endDate"),
+        "city": addr.get("addressLocality"),
+        "country": addr.get("addressCountry"),
         "eventType": "Meetup",
         "industry": "Meetup",
-        "categories": ["Meetup"],
-        "meetup": {
-            "source": "json_ld_detail",
-        },
-    }
-
-
-def _merge_event(base: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any]:
-    merged = {**base, **{key: value for key, value in detail.items() if value not in (None, "", [], {})}}
-    for key in ("location", "organizer", "offers", "meetup"):
-        if isinstance(base.get(key), dict) or isinstance(detail.get(key), dict):
-            merged[key] = {
-                **(base.get(key) if isinstance(base.get(key), dict) else {}),
-                **(detail.get(key) if isinstance(detail.get(key), dict) else {}),
+        "organizerName": organizer.get("name"),
+        "organizerWebsite": organizer.get("url"),
+        "eventImageUrl": image,
+        "description": _strip_html(data.get("description")),
+        "sourceProvider": "meetup",
+        "occurrence": occurrence,
+        "metadataJson": {
+            "id": source_url.rstrip("/").split("/")[-1],
+            "eventStatus": data.get("eventStatus"),
+            "eventAttendanceMode": data.get("eventAttendanceMode"),
+            "meetup": {
+                "source": "json_ld_detail",
             }
+        }
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
+
+
+def _merge_event(base: GenericMappedEventDict, detail: GenericMappedEventDict) -> GenericMappedEventDict:
+    merged: GenericMappedEventDict = {**base} # type: ignore
+    for key, value in detail.items():
+        if value not in (None, "", [], {}):
+            if key == "occurrence":
+                base_occ = base.get("occurrence", {})
+                merged["occurrence"] = {**base_occ, **value} # type: ignore
+                merged["occurrence"] = {k: v for k, v in merged["occurrence"].items() if v is not None} # type: ignore
+            elif key == "metadataJson":
+                base_meta = base.get("metadataJson", {})
+                merged_meta = {**base_meta, **value}
+                if "meetup" in base_meta and "meetup" in value:
+                    merged_meta["meetup"] = {**base_meta["meetup"], **value["meetup"]}
+                merged["metadataJson"] = merged_meta
+            else:
+                merged[key] = value # type: ignore
     return merged
 
 
@@ -795,4 +805,5 @@ async def ingest_meetup_events_to_eagle(
         source_provider="meetup",
         parse_failures=parse_failures,
         persist=persist,
+        already_mapped=True,
     )
