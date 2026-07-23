@@ -44,10 +44,7 @@ from meetup_crawler import (
     crawl_meetup_events_with_diagnostics,
     ingest_meetup_events_to_eagle,
 )
-from stubhub_crawler import (
-    crawl_stubhub_events_with_diagnostics,
-    ingest_stubhub_events_to_eagle,
-)
+
 from conferank_crawler import (
     crawl_conferank_events,
     ingest_conferank_events_to_eagle,
@@ -61,10 +58,7 @@ from international_conference_alerts_crawler import (
     crawl_ica_events_with_diagnostics,
     ingest_ica_events_to_eagle,
 )
-from firecrawl_scraper import (
-    crawl_firecrawl_events_with_diagnostics,
-    ingest_firecrawl_events_to_eagle,
-)
+
 from ten_times_crawler import (
     crawl_ten_times_events_with_diagnostics,
     ingest_ten_times_events_to_eagle,
