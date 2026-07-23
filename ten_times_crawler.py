@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericAttendeeDict, GenericCompanyDict, GenericMappedEventDict, GenericOccurrenceDict
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +358,124 @@ def _parse_detail_event(html: str, source_url: str) -> Dict[str, Any]:
     }
 
 
+def _first_string(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+    return None
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        try:
+            if value is not None and str(value).strip() != "":
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _map_10times_event_to_generic(raw_event: Dict[str, Any]) -> Optional[GenericMappedEventDict]:
+    name = _first_string(raw_event.get("name"), raw_event.get("title"))
+    if not name:
+        return None
+
+    location = raw_event.get("location") if isinstance(raw_event.get("location"), dict) else {}
+    address = location.get("address") if isinstance(location.get("address"), dict) else {}
+    organizer = raw_event.get("organizer") if isinstance(raw_event.get("organizer"), dict) else {}
+    enriched = raw_event.get("enriched_details") if isinstance(raw_event.get("enriched_details"), dict) else {}
+
+    city = _first_string(
+        address.get("addressLocality"),
+        raw_event.get("city"),
+        raw_event.get("locationText"),
+    )
+    country = _first_string(address.get("addressCountry"), raw_event.get("country"))
+    venue_name = _first_string(location.get("name"), raw_event.get("venueName"), enriched.get("venue_name"))
+    street_address = _first_string(address.get("streetAddress"), enriched.get("venue_address"))
+
+    speakers = enriched.get("speakers") if isinstance(enriched.get("speakers"), list) else []
+    attendees: List[GenericAttendeeDict] = []
+    for speaker in speakers:
+        if not isinstance(speaker, dict):
+            continue
+        speaker_name = _first_string(speaker.get("name"))
+        if not speaker_name:
+            continue
+        attendees.append(
+            {
+                "fullName": speaker_name,
+                "title": _first_string(speaker.get("role")),
+                "linkedInUrl": _first_string(speaker.get("linkedin")),
+                "relationshipType": "SPEAKER",
+                "metadataJson": {"sourceProvider": "10times", "speaker": speaker},
+            }
+        )
+
+    sponsors = enriched.get("sponsors") if isinstance(enriched.get("sponsors"), list) else []
+    companies: List[GenericCompanyDict] = []
+    for sponsor in sponsors:
+        if not isinstance(sponsor, dict):
+            continue
+        sponsor_name = _first_string(sponsor.get("name"))
+        if not sponsor_name:
+            continue
+        companies.append(
+            {
+                "name": sponsor_name,
+                "websiteUrl": _first_string(sponsor.get("website")),
+                "relationshipType": _first_string(sponsor.get("tier"), "Sponsor"),
+                "metadataJson": {"sourceProvider": "10times", "sponsor": sponsor},
+            }
+        )
+
+    occurrence: GenericOccurrenceDict = {
+        "locationText": _first_string(raw_event.get("locationText"), venue_name, street_address, city),
+        "latitude": _first_float(location.get("latitude"), raw_event.get("latitude")),
+        "longitude": _first_float(location.get("longitude"), raw_event.get("longitude")),
+        "venueName": venue_name,
+        "streetAddress": street_address,
+        "city": city,
+        "region": _first_string(address.get("addressRegion")),
+        "postalCode": _first_string(address.get("postalCode")),
+        "country": country,
+        "timezone": _first_string(raw_event.get("timezone")),
+    }
+    occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
+
+    categories = raw_event.get("categories") if isinstance(raw_event.get("categories"), list) else raw_event.get("keywords")
+    category = _first_string(*(categories or [])) if isinstance(categories, list) else _first_string(categories)
+
+    metadata = {
+        **raw_event,
+        "sourceProvider": "10times",
+    }
+
+    event: GenericMappedEventDict = {
+        "name": name,
+        "sourceUrl": _first_string(raw_event.get("sourceUrl"), raw_event.get("url")),
+        "startAt": _first_string(raw_event.get("startAt"), raw_event.get("startDate")),
+        "endAt": _first_string(raw_event.get("endAt"), raw_event.get("endDate")),
+        "city": city,
+        "country": country,
+        "eventType": _first_string(raw_event.get("eventType"), category, "Conference"),
+        "category": category,
+        "organizerName": _first_string(organizer.get("name"), raw_event.get("organizerName")),
+        "organizerWebsite": _first_string(organizer.get("url"), raw_event.get("organizerWebsite")),
+        "eventImageUrl": _first_string(raw_event.get("image"), raw_event.get("eventImageUrl")),
+        "industry": category,
+        "description": _clean_text(raw_event.get("description")),
+        "sourceProvider": "10times",
+        "attendees": attendees,
+        "companies": companies,
+        "occurrence": occurrence,
+        "metadataJson": metadata,
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
+
+
 def _dedupe_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -443,7 +562,7 @@ async def crawl_ten_times_events_with_diagnostics(
         parse_failures.append({"reason": "no_events_found", "list_url": list_url})
 
     return {
-        "events": events,
+        "events": [mapped for event in events if (mapped := _map_10times_event_to_generic(event))],
         "parse_failures": [*parse_failures, *failures],
         "diagnostics": diagnostics,
     }
@@ -465,6 +584,7 @@ async def ingest_ten_times_events_to_eagle(
         source_provider="10times",
         parse_failures=parse_failures,
         persist=persist,
+        already_mapped=True,
     )
     response["diagnostics"] = diagnostics or {}
     return response

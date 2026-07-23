@@ -72,6 +72,7 @@ class ConferankIngestRequest(BaseModel):
     location: Optional[str] = Field(default=None, description="Filter by location (e.g. Las Vegas)")
     date_from: Optional[str] = Field(default=None, description="Filter from date (YYYY-MM-DD)")
     date_to: Optional[str] = Field(default=None, description="Filter to date (YYYY-MM-DD)")
+    category: Optional[str] = Field(default=None, description="Category to assign to every mapped event")
     source: Literal["auto", "api", "html"] = Field(
         "auto",
         description="Conferank crawl source: auto/html uses HTML parsing since no API is available.",
@@ -87,6 +88,7 @@ class HumanitixIngestRequest(BaseModel):
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID, reserved for future workspace visibility")
     location: str = Field(..., description="Humanitix location slug, e.g. au--nsw--sydney or us--ny--new-york")
     keyword: str = Field("conference", description="Humanitix keyword")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     source: Literal["auto", "api", "html"] = Field(
         "auto",
         description="Humanitix crawl source: auto tries API then HTML fallback; api uses /api/search; html uses page HTML only",
@@ -108,6 +110,7 @@ class UniverseIngestRequest(BaseModel):
         description="Latitude/longitude pair used by Universe search, e.g. 40.7127753,-74.0059728",
     )
     keyword: str = Field("music", description="Universe search keyword")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     source: Literal["auto", "api", "html"] = Field(
         "auto",
         description="Universe crawl source: auto/api uses Universe GraphQL; html reports fallback diagnostics because public pages are SPA shells",
@@ -119,6 +122,7 @@ class UniverseIngestRequest(BaseModel):
 class LumaIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     category_slug: Optional[str] = Field(
         "tech",
         description="Luma discovery category slug, e.g. tech, food. Used when calendar_api_id is omitted.",
@@ -151,6 +155,7 @@ class LumaIngestRequest(BaseModel):
 class MeetupIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     search_url: Optional[str] = Field(
         None,
         description="Optional full Meetup /find URL. Example: https://www.meetup.com/find/?location=us--ny--New+York&source=EVENTS&keywords=conference",
@@ -174,6 +179,7 @@ class MeetupIngestRequest(BaseModel):
 class DiscoverEventsIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     search_url: Optional[str] = Field(
         None,
         description="Optional full Discover Events /forme URL. Example: https://discover.events.com/forme?lat=40.7127837&lng=-74.00594130000002&day=2026-7-3",
@@ -196,6 +202,7 @@ class DiscoverEventsIngestRequest(BaseModel):
 class InternationalConferenceAlertsIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     search_url: Optional[str] = Field(
         None,
         description="Optional full InternationalConferenceAlerts search/detail URL. Example: https://internationalconferencealerts.com/conferences?q=tech&country=&month=",
@@ -232,6 +239,7 @@ class InternationalConferenceAlertsCrawlResponse(BaseModel):
 class FirecrawlScraperIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     list_url: str = Field(..., description="List/search page URL to scrape with Firecrawl")
     limit: int = Field(20, ge=1, le=100, description="Maximum detail event URLs to scrape")
     event_url_regex: Optional[str] = Field(
@@ -262,6 +270,7 @@ class FirecrawlScraperIngestRequest(BaseModel):
 class TenTimesIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     list_url: str = Field(
         "https://10times.com/newyork-us/conferences",
         description="10times list URL, e.g. https://10times.com/newyork-us/conferences",
@@ -288,6 +297,7 @@ class TenTimesCrawlResponse(BaseModel):
 class StubHubIngestRequest(BaseModel):
     organization_id: Optional[str] = Field(None, description="Optional Eagle organization UUID override")
     workspace_id: Optional[str] = Field(None, description="Optional Eagle workspace UUID")
+    category: Optional[str] = Field(None, description="Category to assign to every mapped event")
     keyword: Optional[str] = Field(
         None,
         description="Optional StubHub search keyword. Used only when search_url is omitted or has no q query.",

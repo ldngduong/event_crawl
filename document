@@ -1,0 +1,38 @@
+http://localhost:8006/international-conference-alerts/events/ingestc
+{
+    "organization_id": "4c79cc31-2197-4228-be1a-1b81e7fdf7d1",
+    "search_url": "https://internationalconferencealerts.com/conferences?q=tech&country=&month=",
+    "source": "html",
+    "limit": 100,
+    "enrich_details": true,
+    "persist": true,
+    "category": "api"
+}
+
+
+
+http://localhost:8006/discover/events/ingest
+{
+    "search_url": "https://discover.events.com/forme?lat=40.7127837&lng=-74.00594130000002&day=2026-7-21",
+    "radius": 96.56,
+//   "radius": 48.28,
+//   "radius": 24.14,
+//   "radius": 8.05,
+//   "radius": 4.83,
+    "source": "auto",
+    "limit": 100,
+    "enrich_details": true,
+    "persist": true, 
+    "category": "api"
+}
+
+
+http://localhost:8006/meetup/events/ingest
+{
+    "search_url": "https://www.meetup.com/find/?location=us--ny--Riverhead&source=GROUPS&distance=anyDistance",
+    "source": "auto",
+    "limit": 10,
+    "enrich_details": true,
+    "persist": true, 
+    "category": "api"
+}

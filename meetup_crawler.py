@@ -582,6 +582,61 @@ def _sanitize_meetup_event_for_eagle(event: Dict[str, Any]) -> Dict[str, Any]:
     return sanitized
 
 
+_ONLINE_EVENT_VALUES = {
+    "online",
+    "online event",
+    "virtual",
+    "virtual event",
+    "webinar",
+    "zoom",
+    "remote",
+}
+_ONLINE_TITLE_PATTERN = re.compile(r"\b(?:online|virtual|webinar|zoom|conference call)\b", re.IGNORECASE)
+
+
+def _is_online_meetup_event(event: Dict[str, Any]) -> bool:
+    occurrence = event.get("occurrence") if isinstance(event.get("occurrence"), dict) else {}
+    metadata = event.get("metadataJson") if isinstance(event.get("metadataJson"), dict) else {}
+    meetup = metadata.get("meetup") if isinstance(metadata.get("meetup"), dict) else {}
+    meetup_venue = meetup.get("venue") if isinstance(meetup.get("venue"), dict) else {}
+
+    values: List[Any] = [
+        event.get("eventType"),
+        event.get("industry"),
+        occurrence.get("locationText"),
+        occurrence.get("venueName"),
+        meetup_venue.get("name"),
+    ]
+    categories = metadata.get("categories")
+    if isinstance(categories, list):
+        values.extend(categories)
+
+    for value in values:
+        if isinstance(value, str) and value.strip().lower() in _ONLINE_EVENT_VALUES:
+            return True
+
+    has_physical_location = any(
+        isinstance(value, str) and value.strip()
+        for value in (
+            event.get("city"),
+            event.get("country"),
+            occurrence.get("locationText"),
+            occurrence.get("venueName"),
+            occurrence.get("streetAddress"),
+            meetup_venue.get("name"),
+            meetup_venue.get("address"),
+            meetup_venue.get("city"),
+            meetup_venue.get("country"),
+        )
+    )
+    name = event.get("name")
+    return not has_physical_location and isinstance(name, str) and bool(_ONLINE_TITLE_PATTERN.search(name))
+
+
+def _filter_online_meetup_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [event for event in events if not _is_online_meetup_event(event)]
+
+
 async def _post_meetup_graphql(client: httpx.AsyncClient, payload: Dict[str, Any]) -> Dict[str, Any]:
     response = await client.post(MEETUP_GQL_URL, json=payload)
     response.raise_for_status()
@@ -746,7 +801,7 @@ async def crawl_meetup_events_with_diagnostics(
 
     if source == "html":
         events, failures = await _crawl_meetup_html_detail(search_url)
-        return {"events": events[:limit], "parse_failures": failures}
+        return {"events": _filter_online_meetup_events(events)[:limit], "parse_failures": failures}
 
     events, failures = await _search_meetup_api_events(
         keyword=keyword,
@@ -760,7 +815,7 @@ async def crawl_meetup_events_with_diagnostics(
     parse_failures.extend(failures)
 
     if not enrich_details or not events:
-        return {"events": events[:limit], "parse_failures": parse_failures}
+        return {"events": _filter_online_meetup_events(events)[:limit], "parse_failures": parse_failures}
 
     enriched: List[Dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=45, headers=MEETUP_HEADERS, follow_redirects=True) as client:
@@ -787,7 +842,7 @@ async def crawl_meetup_events_with_diagnostics(
     for event in enriched:
         key = str(event.get("source_url") or event.get("url") or event.get("id") or len(deduped))
         deduped[key] = event
-    return {"events": list(deduped.values())[:limit], "parse_failures": parse_failures}
+    return {"events": _filter_online_meetup_events(list(deduped.values()))[:limit], "parse_failures": parse_failures}
 
 
 async def ingest_meetup_events_to_eagle(

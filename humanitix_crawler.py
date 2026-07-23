@@ -114,6 +114,12 @@ def _json_loads_safe(value: str) -> Optional[Any]:
         return None
 
 
+def _strip_html(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return BeautifulSoup(value, "html.parser").get_text(" ", strip=True) or None
+
+
 def _is_event_type(value: Any) -> bool:
     if isinstance(value, list):
         return any(_is_event_type(item) for item in value)
@@ -188,6 +194,25 @@ def _address_component_value(components: Any, component_type: str) -> Optional[s
     return None
 
 
+def _is_humanitix_placeholder_location(value: Any) -> bool:
+    text = _read_string(value)
+    if not text:
+        return False
+    return text.lower() in {
+        "hosted on humanitix",
+        "humanitix",
+        "online event",
+        "online",
+    }
+
+
+def _clean_humanitix_location_value(value: Any) -> Optional[str]:
+    text = _read_string(value)
+    if not text or _is_humanitix_placeholder_location(text):
+        return None
+    return text
+
+
 def _compact_humanitix_search_event(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     slug = data.get("slug")
     if not isinstance(slug, str) or not slug:
@@ -223,10 +248,10 @@ def _compact_humanitix_search_event(data: Dict[str, Any]) -> Optional[Dict[str, 
         "description": data.get("name"),
         "location": {
             "@type": "Place",
-            "name": event_location.get("venueName"),
+            "name": _clean_humanitix_location_value(event_location.get("venueName")),
             "address": {
                 "@type": "PostalAddress",
-                "streetAddress": event_location.get("address"),
+                "streetAddress": _clean_humanitix_location_value(event_location.get("address")),
                 "addressLocality": _address_component_value(address_components, "locality"),
                 "addressRegion": _address_component_value(address_components, "administrative_area_level_1"),
                 "postalCode": _address_component_value(address_components, "postal_code"),
@@ -291,6 +316,211 @@ def _extract_humanitix_page_props(html: str) -> Dict[str, Any]:
         else {}
     )
     return page_props if isinstance(page_props, dict) else {}
+
+
+def _pick_humanitix_detail_payload(value: Any, slug: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+
+    direct_keys = (
+        "event",
+        "eventData",
+        "eventDetails",
+        "initialEvent",
+        "initialEventData",
+        "listing",
+        "page",
+    )
+    for key in direct_keys:
+        candidate = value.get(key)
+        if isinstance(candidate, dict):
+            picked = _pick_humanitix_detail_payload(candidate, slug)
+            if picked:
+                return picked
+
+    candidate_slug = _read_string(value.get("slug"))
+    has_matching_slug = bool(slug and candidate_slug == slug)
+    has_event_shape = bool(
+        _read_string(value.get("name"))
+        and (
+            isinstance(value.get("date"), dict)
+            or isinstance(value.get("eventLocation"), dict)
+            or isinstance(value.get("organiser"), dict)
+            or isinstance(value.get("organizer"), dict)
+            or value.get("tickets")
+            or value.get("ticketTypes")
+        )
+    )
+    if has_matching_slug or has_event_shape:
+        return value
+
+    for child in value.values():
+        if isinstance(child, dict):
+            picked = _pick_humanitix_detail_payload(child, slug)
+            if picked:
+                return picked
+        elif isinstance(child, list):
+            for item in child:
+                picked = _pick_humanitix_detail_payload(item, slug)
+                if picked:
+                    return picked
+    return None
+
+
+def _humanitix_offer_from_ticket(ticket: Dict[str, Any], source_url: str) -> Dict[str, Any]:
+    price = (
+        ticket.get("price")
+        if ticket.get("price") is not None
+        else ticket.get("amount")
+        if ticket.get("amount") is not None
+        else ticket.get("cost")
+    )
+    currency = _first_string(ticket.get("currency"), ticket.get("priceCurrency"))
+    return {
+        "@type": "Offer",
+        "url": f"{source_url.rstrip('/')}/tickets",
+        "name": _first_string(ticket.get("name"), ticket.get("title"), ticket.get("label")),
+        "price": price,
+        "availability": _first_string(ticket.get("availability"), ticket.get("status")),
+        "availabilityStarts": _first_string(ticket.get("availabilityStarts"), ticket.get("salesStartDate"), ticket.get("startDate")),
+        "availabilityEnds": _first_string(ticket.get("availabilityEnds"), ticket.get("salesEndDate"), ticket.get("endDate")),
+        "priceCurrency": currency,
+        "validFrom": _first_string(ticket.get("validFrom")),
+    }
+
+
+def _compact_humanitix_detail_payload(data: Dict[str, Any], source_url: str) -> Optional[Dict[str, Any]]:
+    name = _first_string(data.get("name"), data.get("title"))
+    if not name:
+        return None
+
+    clean_source_url = _clean_url(_first_string(data.get("url"), source_url) or source_url)
+    date = data.get("date") if isinstance(data.get("date"), dict) else {}
+    event_location = data.get("eventLocation") if isinstance(data.get("eventLocation"), dict) else {}
+    address_components = event_location.get("addressComponents")
+    organiser = (
+        data.get("organiser")
+        if isinstance(data.get("organiser"), dict)
+        else data.get("organizer")
+        if isinstance(data.get("organizer"), dict)
+        else data.get("host")
+        if isinstance(data.get("host"), dict)
+        else {}
+    )
+    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
+    banner_image = data.get("bannerImage") if isinstance(data.get("bannerImage"), dict) else {}
+    tickets = data.get("tickets") if isinstance(data.get("tickets"), list) else data.get("ticketTypes")
+    ticket_items = [item for item in tickets if isinstance(item, dict)] if isinstance(tickets, list) else []
+    start_date = _parse_humanitix_date(_first_string(data.get("startDate"), date.get("startDate")))
+    end_date = _parse_humanitix_date(_first_string(data.get("endDate"), date.get("endDate")))
+    event_id = _first_string(data.get("_id"), data.get("id"), _event_id_from_url(clean_source_url))
+    if start_date:
+        event_id = f"{event_id}:{start_date}"
+
+    offers: Any = {
+        "@type": "AggregateOffer",
+        "lowPrice": pricing.get("minimumPrice"),
+        "highPrice": pricing.get("maximumPrice"),
+        "priceCurrency": _first_string(pricing.get("currency"), pricing.get("priceCurrency")),
+    }
+    if ticket_items:
+        offers = [_humanitix_offer_from_ticket(item, clean_source_url) for item in ticket_items]
+
+    compact = {
+        "@type": "Event",
+        "id": event_id,
+        "name": name,
+        "url": clean_source_url,
+        "source_url": clean_source_url,
+        "startDate": start_date,
+        "endDate": end_date,
+        "timezone": _first_string(data.get("timezone"), date.get("timezone")),
+        "eventStatus": _first_string(data.get("eventStatus"), "https://schema.org/EventScheduled"),
+        "eventAttendanceMode": _first_string(data.get("eventAttendanceMode"), "https://schema.org/OfflineEventAttendanceMode"),
+        "image": _first_image_url(data.get("image") or data.get("eventImageUrl") or _humanitix_image_url(banner_image.get("handle"))),
+        "description": _strip_html(_first_string(data.get("descriptionHtml"), data.get("description"), data.get("summary"))),
+        "capacity": _first_int(data.get("capacity"), data.get("maxAttendees"), data.get("attendeeLimit")),
+        "location": {
+            "@type": "Place",
+            "name": _first_string(
+                _clean_humanitix_location_value(event_location.get("venueName")),
+                _clean_humanitix_location_value(event_location.get("name")),
+            ),
+            "address": {
+                "@type": "PostalAddress",
+                "streetAddress": _first_string(
+                    _clean_humanitix_location_value(event_location.get("address")),
+                    _clean_humanitix_location_value(event_location.get("formattedAddress")),
+                ),
+                "addressLocality": _first_string(
+                    event_location.get("city"),
+                    _address_component_value(address_components, "locality"),
+                ),
+                "addressRegion": _first_string(
+                    event_location.get("region"),
+                    event_location.get("state"),
+                    _address_component_value(address_components, "administrative_area_level_1"),
+                ),
+                "postalCode": _first_string(
+                    event_location.get("postalCode"),
+                    _address_component_value(address_components, "postal_code"),
+                ),
+                "addressCountry": _first_string(
+                    event_location.get("country"),
+                    _address_component_value(address_components, "country"),
+                ),
+            },
+        },
+        "organizer": {
+            "@type": "Organization",
+            "name": _first_string(organiser.get("name"), organiser.get("displayName")),
+            "url": _first_string(organiser.get("website"), organiser.get("url"), organiser.get("websiteUrl")),
+            "email": _first_string(organiser.get("email"), organiser.get("contactEmail")),
+            "telephone": _first_string(organiser.get("phone"), organiser.get("contactPhone")),
+        },
+        "offers": offers,
+        "humanitix": {
+            "event_id": data.get("_id"),
+            "slug": _first_string(data.get("slug"), _event_id_from_url(clean_source_url)),
+            "host_total_followers": data.get("hostTotalFollowers"),
+            "organizer_id": organiser.get("_id") or organiser.get("id"),
+            "organizer_followers": organiser.get("followerCount"),
+            "is_recurring": data.get("isRecurring"),
+            "location": data.get("location"),
+            "capacity": _first_int(data.get("capacity"), data.get("maxAttendees"), data.get("attendeeLimit")),
+            "eventLocation": event_location,
+        },
+        "extraction_source": "next_data_detail",
+    }
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def _extract_humanitix_next_data_events(html: str, source_url: str) -> List[Dict[str, Any]]:
+    page_props = _extract_humanitix_page_props(html)
+    slug = _event_id_from_url(source_url)
+    payload = _pick_humanitix_detail_payload(page_props, slug)
+    compact = _compact_humanitix_detail_payload(payload, source_url) if payload else None
+    return [compact] if compact else []
+
+
+def _extract_humanitix_detail_events(html: str, source_url: str) -> List[Dict[str, Any]]:
+    extracted: List[Dict[str, Any]] = []
+    for extractor in (
+        _extract_json_ld_events,
+        _extract_humanitix_next_data_events,
+        _extract_humanitix_detail_fallback,
+    ):
+        try:
+            extracted.extend(extractor(html, source_url))
+        except Exception as error:
+            logger.debug("Humanitix detail extractor failed url=%s extractor=%s error=%s", source_url, extractor.__name__, error)
+
+    merged_by_key: Dict[str, Dict[str, Any]] = {}
+    for event in extracted:
+        key = str(event.get("url") or event.get("source_url") or event.get("id") or len(merged_by_key))
+        current = merged_by_key.get(key)
+        merged_by_key[key] = _merge_humanitix_events(current, event) if current else event
+    return list(merged_by_key.values())
 
 
 def _humanitix_search_api_payload(
@@ -425,6 +655,35 @@ def _extract_json_ld_events(html: str, source_url: str) -> List[Dict[str, Any]]:
     return events
 
 
+def _extract_text_after_humanitix_heading(soup: BeautifulSoup, heading: str) -> Optional[str]:
+    heading_node = soup.find(
+        ["h1", "h2", "h3", "h4", "h5"],
+        string=lambda value: bool(value and value.strip().lower() == heading.lower()),
+    )
+    if not heading_node:
+        return None
+
+    parts: List[str] = []
+    for node in heading_node.find_all_next(["p", "li", "h2", "h3", "h4"]):
+        text = " ".join(node.get_text(" ", strip=True).split())
+        if not text:
+            continue
+        if text.lower() == heading.lower():
+            continue
+        if re.search(r"^(Get tickets|Refund Policy|Contact host|Share this event|Date and time|Location|Hosted by)\b", text, re.IGNORECASE):
+            break
+        if len(text) < 4:
+            continue
+        if parts and text in parts[-1]:
+            continue
+        parts.append(text)
+        if sum(len(part) for part in parts) >= 12000:
+            break
+
+    description = "\n".join(parts).strip()
+    return description or None
+
+
 def _extract_humanitix_detail_fallback(html: str, source_url: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html or "", "html.parser")
     title_tag = soup.find("meta", attrs={"property": "og:title"})
@@ -453,12 +712,15 @@ def _extract_humanitix_detail_fallback(html: str, source_url: str) -> List[Dict[
     )
     text = " ".join(soup.get_text(" ", strip=True).split())
     description = description_tag.get("content") if description_tag else None
+    section_description = _extract_text_after_humanitix_heading(soup, "Description")
     marker = "Description "
     if marker in text:
         detail_description = text.split(marker, 1)[1]
         detail_description = re.split(r"\s+(Get tickets|Refund Policy|Contact host)\b", detail_description, maxsplit=1)[0]
         if len(detail_description) > len(description or ""):
             description = detail_description
+    if section_description and len(section_description) > len(description or ""):
+        description = section_description
 
     compact = {
         "@type": "Event",
@@ -632,6 +894,21 @@ def _first_string(*values: Any) -> Optional[str]:
     return None
 
 
+def _first_int(*values: Any) -> Optional[int]:
+    for value in values:
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            digits = re.sub(r"[^\d]", "", value)
+            if digits:
+                return int(digits)
+    return None
+
+
 def _first_image_url(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return _read_string(value)
@@ -682,7 +959,10 @@ def _map_humanitix_event_to_generic(raw_event: Dict[str, Any]) -> Optional[Gener
     event_location = humanitix.get("eventLocation") if isinstance(humanitix.get("eventLocation"), dict) else {}
     organizer = raw_event.get("organizer") if isinstance(raw_event.get("organizer"), dict) else {}
 
-    street_address = _first_string(address.get("streetAddress"), event_location.get("address"))
+    street_address = _first_string(
+        _clean_humanitix_location_value(address.get("streetAddress")),
+        _clean_humanitix_location_value(event_location.get("address")),
+    )
     city = _first_string(
         address.get("addressLocality"),
         raw_event.get("city"),
@@ -695,7 +975,32 @@ def _map_humanitix_event_to_generic(raw_event: Dict[str, Any]) -> Optional[Gener
         event_location.get("addressCountry"),
         humanitix.get("location"),
     )
-    venue_name = _first_string(location.get("name"), event_location.get("venueName"))
+    venue_name = _first_string(
+        _clean_humanitix_location_value(location.get("name")),
+        _clean_humanitix_location_value(event_location.get("venueName")),
+    )
+    organizer_contact = _first_string(
+        raw_event.get("organizerContact"),
+        organizer.get("email"),
+        organizer.get("telephone"),
+        " | ".join(
+            part
+            for part in (
+                _first_string(organizer.get("email")),
+                _first_string(organizer.get("telephone")),
+            )
+            if part
+        ),
+    )
+    expected_attendance = _first_int(
+        raw_event.get("expectedAttendance"),
+        raw_event.get("capacity"),
+        raw_event.get("maxAttendees"),
+        raw_event.get("attendeeLimit"),
+        humanitix.get("capacity"),
+        humanitix.get("maxAttendees"),
+        event_location.get("capacity"),
+    )
 
     occurrence: GenericOccurrenceDict = {
         "locationText": _first_string(venue_name, street_address, raw_event.get("locationText")),
@@ -706,6 +1011,7 @@ def _map_humanitix_event_to_generic(raw_event: Dict[str, Any]) -> Optional[Gener
         "postalCode": _first_string(address.get("postalCode"), event_location.get("postalCode")),
         "country": country,
         "timezone": _first_string(raw_event.get("timezone"), humanitix.get("timezone")),
+        "expectedAttendance": expected_attendance,
     }
     occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
 
@@ -725,8 +1031,10 @@ def _map_humanitix_event_to_generic(raw_event: Dict[str, Any]) -> Optional[Gener
         "industry": _first_string(raw_event.get("industry"), raw_event.get("category")),
         "organizerName": _first_string(organizer.get("name"), raw_event.get("organizerName")),
         "organizerWebsite": _first_string(raw_event.get("organizerWebsite"), organizer.get("url"), organizer.get("sameAs")),
+        "organizerContact": organizer_contact,
         "eventImageUrl": _first_image_url(raw_event.get("eventImageUrl") or raw_event.get("image")),
         "description": _read_string(raw_event.get("description")),
+        "expectedAttendance": expected_attendance,
         "sourceProvider": "humanitix",
         "occurrence": occurrence,
         "metadataJson": metadata,
@@ -920,9 +1228,7 @@ async def crawl_humanitix_events_with_diagnostics(
                                 },
                             )
                             response.raise_for_status()
-                            detail_extracted = _extract_json_ld_events(response.text, clean_url)
-                            if not detail_extracted:
-                                detail_extracted = _extract_humanitix_detail_fallback(response.text, clean_url)
+                            detail_extracted = _extract_humanitix_detail_events(response.text, clean_url)
                     except Exception as detail_error:
                         logger.warning("Humanitix detail HTTP parse failed url=%s error=%s", clean_url, detail_error)
 
@@ -948,7 +1254,7 @@ async def crawl_humanitix_events_with_diagnostics(
                         )
                         return
 
-                    extracted = _extract_json_ld_events(result.html or "", clean_url)
+                    extracted = _extract_humanitix_detail_events(result.html or "", clean_url)
                     if extracted:
                         events.extend(extracted)
                     else:

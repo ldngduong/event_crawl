@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericMappedEventDict, GenericOccurrenceDict
 
 os.environ.setdefault(
     "CRAWL4_AI_BASE_DIRECTORY",
@@ -200,6 +201,16 @@ def _first_string(*values: Any) -> Optional[str]:
             return value.strip()
         if isinstance(value, (int, float)):
             return str(value)
+    return None
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        try:
+            if value is not None and str(value).strip() != "":
+                return float(value)
+        except (TypeError, ValueError):
+            continue
     return None
 
 
@@ -430,6 +441,56 @@ def _compact_discover_evt(evt: Dict[str, Any], page_url: str) -> Optional[Dict[s
     }
 
     return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def _map_discover_event_to_generic(raw_event: Dict[str, Any]) -> Optional[GenericMappedEventDict]:
+    name = _first_string(raw_event.get("name"), raw_event.get("title"))
+    if not name:
+        return None
+
+    location = raw_event.get("location") if isinstance(raw_event.get("location"), dict) else {}
+    address = location.get("address") if isinstance(location.get("address"), dict) else {}
+    geo = location.get("geo") if isinstance(location.get("geo"), dict) else {}
+    organizer = raw_event.get("organizer") if isinstance(raw_event.get("organizer"), dict) else {}
+
+    city = _first_string(address.get("addressLocality"), raw_event.get("city"))
+    country = _first_string(address.get("addressCountry"), raw_event.get("country"))
+    latitude = _first_float(raw_event.get("latitude"), geo.get("latitude"))
+    longitude = _first_float(raw_event.get("longitude"), geo.get("longitude"))
+
+    occurrence: GenericOccurrenceDict = {
+        "locationText": _first_string(location.get("name"), address.get("streetAddress"), city),
+        "latitude": latitude,
+        "longitude": longitude,
+        "venueName": _first_string(location.get("name")),
+        "streetAddress": _first_string(address.get("streetAddress")),
+        "city": city,
+        "region": _first_string(address.get("addressRegion")),
+        "postalCode": _first_string(address.get("postalCode")),
+        "country": country,
+        "timezone": _first_string(raw_event.get("timezone")),
+    }
+    occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
+
+    event: GenericMappedEventDict = {
+        "name": name,
+        "sourceUrl": _first_string(raw_event.get("url"), raw_event.get("source_url")),
+        "startAt": _first_string(raw_event.get("startDate")),
+        "endAt": _first_string(raw_event.get("endDate")),
+        "city": city,
+        "country": country,
+        "eventType": _first_string(raw_event.get("eventType"), raw_event.get("category"), "Event"),
+        "category": _first_string(raw_event.get("category")),
+        "organizerName": _first_string(organizer.get("name")),
+        "organizerWebsite": _first_string(organizer.get("url")),
+        "eventImageUrl": _first_string(raw_event.get("image")),
+        "industry": _first_string(raw_event.get("category"), raw_event.get("eventType")),
+        "description": _first_string(raw_event.get("description")),
+        "sourceProvider": "discover",
+        "occurrence": occurrence,
+        "metadataJson": {**raw_event, "sourceProvider": "discover"},
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
 
 
 def _extract_discover_event_links(html: str) -> List[str]:
@@ -730,7 +791,8 @@ async def crawl_discover_events_with_diagnostics(
                     "discoverEvents": {"event_id": _event_id_from_url(url), "source": "search_url_only"},
                 }
             )
-        return {"events": events, "parse_failures": parse_failures}
+        mapped_events = [mapped for event in events if (mapped := _map_discover_event_to_generic(event))]
+        return {"events": mapped_events, "parse_failures": parse_failures}
 
     semaphore = asyncio.Semaphore(max(1, concurrency))
     events: List[Dict[str, Any]] = []
@@ -756,7 +818,7 @@ async def crawl_discover_events_with_diagnostics(
         deduped[key] = event
 
     return {
-        "events": list(deduped.values())[:limit],
+        "events": [mapped for event in list(deduped.values())[:limit] if (mapped := _map_discover_event_to_generic(event))],
         "parse_failures": parse_failures,
     }
 
@@ -776,4 +838,5 @@ async def ingest_discover_events_to_eagle(
         source_provider="discover",
         parse_failures=parse_failures,
         persist=persist,
+        already_mapped=True,
     )

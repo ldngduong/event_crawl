@@ -10,7 +10,7 @@ if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, HTTPException, Query
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, unquote_plus, urlparse
 from schemas import (
     EagleIngestResponse,
@@ -44,10 +44,17 @@ from meetup_crawler import (
     crawl_meetup_events_with_diagnostics,
     ingest_meetup_events_to_eagle,
 )
-from stubhub_crawler import (
-    crawl_stubhub_events_with_diagnostics,
-    ingest_stubhub_events_to_eagle,
-)
+try:
+    from stubhub_crawler import (
+        crawl_stubhub_events_with_diagnostics,
+        ingest_stubhub_events_to_eagle,
+    )
+except ModuleNotFoundError:
+    async def crawl_stubhub_events_with_diagnostics(**_: object):
+        raise HTTPException(status_code=501, detail="stubhub_crawler.py is not available")
+
+    async def ingest_stubhub_events_to_eagle(**_: object):
+        raise HTTPException(status_code=501, detail="stubhub_crawler.py is not available")
 from conferank_crawler import (
     crawl_conferank_events,
     ingest_conferank_events_to_eagle,
@@ -61,14 +68,22 @@ from international_conference_alerts_crawler import (
     crawl_ica_events_with_diagnostics,
     ingest_ica_events_to_eagle,
 )
-from firecrawl_scraper import (
-    crawl_firecrawl_events_with_diagnostics,
-    ingest_firecrawl_events_to_eagle,
-)
+try:
+    from firecrawl_scraper import (
+        crawl_firecrawl_events_with_diagnostics,
+        ingest_firecrawl_events_to_eagle,
+    )
+except ModuleNotFoundError:
+    async def crawl_firecrawl_events_with_diagnostics(**_: object):
+        raise HTTPException(status_code=501, detail="firecrawl_scraper.py is not available")
+
+    async def ingest_firecrawl_events_to_eagle(**_: object):
+        raise HTTPException(status_code=501, detail="firecrawl_scraper.py is not available")
 from ten_times_crawler import (
     crawl_ten_times_events_with_diagnostics,
     ingest_ten_times_events_to_eagle,
 )
+from ten_minute_mail import TenMinuteMailClient
 import httpx
 import uvicorn
 import logging
@@ -76,6 +91,7 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+ten_minute_mail_client = TenMinuteMailClient()
 
 app = FastAPI(
     title="Eagle Event Crawler API",
@@ -83,11 +99,47 @@ app = FastAPI(
     version="1.0.0"
 )
 
+def _apply_request_category(
+    events: List[Dict[str, Any]],
+    category: Optional[str],
+) -> List[Dict[str, Any]]:
+    requested_category = category.strip() if isinstance(category, str) else None
+    normalized_events: List[Dict[str, Any]] = []
+    for event in events:
+        normalized_events.append(
+            {
+                "name": event.get("name"),
+                "sourceUrl": event.get("sourceUrl"),
+                "startAt": event.get("startAt"),
+                "endAt": event.get("endAt"),
+                "city": event.get("city"),
+                "country": event.get("country"),
+                "eventType": event.get("eventType"),
+                "category": requested_category,
+                "organizerName": event.get("organizerName"),
+                "organizerWebsite": event.get("organizerWebsite"),
+                "organizerContact": event.get("organizerContact"),
+                "eventImageUrl": event.get("eventImageUrl"),
+                "industry": event.get("industry"),
+                "expectedAttendance": event.get("expectedAttendance"),
+                "description": event.get("description"),
+                "sourceProvider": event.get("sourceProvider"),
+                "attendees": event.get("attendees") or [],
+                "occurrence": event.get("occurrence") or {},
+                "companies": event.get("companies") or [],
+                "metadataJson": event.get("metadataJson") or {},
+            }
+        )
+    return normalized_events
+
 @app.get("/")
 async def root():
     return {
         "message": "Crawler API is running.",
         "endpoints": {
+            "ten_minute_mail_address": "/ten-minute-mail/address",
+            "ten_minute_mail_messages": "/ten-minute-mail/messages",
+            "ten_minute_mail_otp": "/ten-minute-mail/otp",
             "humanitix_events": "/humanitix/events/{location}",
             "humanitix_ingest": "/humanitix/events/ingest",
             "universe_ingest": "/universe/events/ingest",
@@ -101,6 +153,119 @@ async def root():
             "international_conference_alerts_ingest": "/international-conference-alerts/events/ingest",
         }
     }
+
+
+@app.on_event("shutdown")
+async def close_ten_minute_mail_client():
+    await ten_minute_mail_client.aclose()
+
+
+@app.get("/ten-minute-mail/address")
+async def get_ten_minute_mail_address(
+    force_new: bool = Query(False, description="Force a fresh inbox"),
+    domain_suffix: Optional[str] = Query(".net", description="Preferred email suffix, e.g. .net or .com"),
+):
+    """
+    Get a 10minutemail address and remaining lifetime.
+    Reuses the current inbox until it expires unless force_new=true.
+    """
+    try:
+        ten_minute_mail_client.set_preferred_domain_suffix(domain_suffix)
+        email = await ten_minute_mail_client.get_gmail(force_new=force_new)
+        return {
+            "address": email.address,
+            "secondsLeft": email.seconds_left,
+            "expiresAt": email.expires_at,
+        }
+    except Exception as e:
+        logger.error(f"Error getting 10minutemail address: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ten-minute-mail/message-count")
+async def get_ten_minute_mail_message_count(
+    domain_suffix: Optional[str] = Query(".net", description="Preferred email suffix, e.g. .net or .com"),
+):
+    """
+    Get the number of messages received by the current 10minutemail inbox.
+    """
+    try:
+        ten_minute_mail_client.set_preferred_domain_suffix(domain_suffix)
+        email = await ten_minute_mail_client.get_gmail()
+        message_count = await ten_minute_mail_client.get_message_count()
+        return {
+            "address": email.address,
+            "secondsLeft": email.seconds_left,
+            "messageCount": message_count,
+        }
+    except Exception as e:
+        logger.error(f"Error getting 10minutemail message count: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ten-minute-mail/messages")
+async def get_ten_minute_mail_messages(
+    after_message_id: str = Query("0", description="Only return messages after this id"),
+    domain_suffix: Optional[str] = Query(".net", description="Preferred email suffix, e.g. .net or .com"),
+):
+    """
+    Get messages received by the current 10minutemail inbox.
+    """
+    try:
+        ten_minute_mail_client.set_preferred_domain_suffix(domain_suffix)
+        email = await ten_minute_mail_client.get_gmail()
+        messages = await ten_minute_mail_client.get_mails(after_message_id=after_message_id)
+        return {
+            "address": email.address,
+            "secondsLeft": email.seconds_left,
+            "count": len(messages),
+            "messages": messages,
+        }
+    except Exception as e:
+        logger.error(f"Error getting 10minutemail messages: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ten-minute-mail/otp")
+async def get_ten_minute_mail_otp(
+    after_message_id: str = Query("0", description="Only inspect messages after this id"),
+    timeout_seconds: float = Query(60.0, ge=0, le=300, description="How long to poll inbox for OTP"),
+    poll_interval_seconds: float = Query(2.0, ge=0.5, le=30, description="Delay between inbox checks"),
+    otp_digits: int = Query(4, ge=3, le=8, description="Expected OTP length"),
+    sender_contains: Optional[str] = Query("10times", description="Sender/subject/body filter"),
+    domain_suffix: Optional[str] = Query(".net", description="Preferred email suffix, e.g. .net or .com"),
+):
+    """
+    Get a one-time OTP from the current 10minutemail inbox.
+    """
+    try:
+        ten_minute_mail_client.set_preferred_domain_suffix(domain_suffix)
+        email = await ten_minute_mail_client.get_gmail()
+        otp_result = await ten_minute_mail_client.get_otp(
+            after_message_id=after_message_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            otp_digits=otp_digits,
+            sender_contains=sender_contains,
+        )
+        if otp_result is None:
+            return {
+                "address": email.address,
+                "secondsLeft": email.seconds_left,
+                "otp": None,
+                "message": None,
+            }
+
+        return {
+            "address": email.address,
+            "secondsLeft": email.seconds_left,
+            "otp": otp_result.otp,
+            "message": otp_result.message,
+        }
+    except Exception as e:
+        logger.error(f"Error getting 10minutemail OTP: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/debug/fetch-international-conference-alerts")
 async def debug_fetch_international_conference_alerts(
@@ -194,10 +359,11 @@ async def ingest_humanitix_events(request: HumanitixIngestRequest):
             limit=request.limit,
             source=request.source,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_humanitix_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,
         )
@@ -282,10 +448,11 @@ async def ingest_universe_events(request: UniverseIngestRequest):
             source=request.source,
             enrich_details=request.enrich_details,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_universe_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,
         )
@@ -323,10 +490,11 @@ async def ingest_luma_events(request: LumaIngestRequest):
             limit=request.limit,
             source=request.source,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_luma_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             diagnostics=crawl_result.get("diagnostics"),
             persist=request.persist,
@@ -359,10 +527,11 @@ async def ingest_stubhub_events(request: StubHubIngestRequest):
             limit=request.limit,
             enrich_details=request.enrich_details,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_stubhub_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             diagnostics=crawl_result.get("diagnostics", {}),
             persist=request.persist,
@@ -381,8 +550,9 @@ async def ingest_conferank_events(request: ConferankIngestRequest):
             date_from=request.date_from,
             date_to=request.date_to
         )
+        events = _apply_request_category(raw_events, request.category)
         return await ingest_conferank_events_to_eagle(
-            events=raw_events,
+            events=events,
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
             persist=request.persist
@@ -424,10 +594,11 @@ async def ingest_meetup_events(request: MeetupIngestRequest):
             source=request.source,
             enrich_details=request.enrich_details,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_meetup_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,
         )
@@ -465,10 +636,11 @@ async def ingest_discover_events(request: DiscoverEventsIngestRequest):
             source=request.source,
             enrich_details=request.enrich_details,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_discover_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             persist=request.persist,
         )
@@ -510,10 +682,11 @@ async def ingest_firecrawl_scraper_events(request: FirecrawlScraperIngestRequest
             source_provider=request.source_provider,
             event_type=request.event_type,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_firecrawl_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             diagnostics=crawl_result.get("diagnostics", {}),
             persist=request.persist,
@@ -612,10 +785,11 @@ async def ingest_ten_times_events(request: TenTimesIngestRequest):
             enrich_details=request.enrich_details,
             cookie=request.cookie,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_ten_times_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             diagnostics=crawl_result.get("diagnostics", {}),
             persist=request.persist,
@@ -749,10 +923,11 @@ async def ingest_international_conference_alerts_events(request: InternationalCo
             geocode=request.geocode,
             proxy_url=request.proxy_url,
         )
+        events = _apply_request_category(crawl_result["events"], request.category)
         return await ingest_ica_events_to_eagle(
             organization_id=request.organization_id,
             workspace_id=request.workspace_id,
-            events=crawl_result["events"],
+            events=events,
             parse_failures=crawl_result["parse_failures"],
             diagnostics=crawl_result.get("diagnostics", {}),
             persist=request.persist,

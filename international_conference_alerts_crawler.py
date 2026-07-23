@@ -17,6 +17,8 @@ os.environ.setdefault(
 import httpx
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
+from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericMappedEventDict, GenericOccurrenceDict
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +193,8 @@ def _first_string(*values: Any) -> Optional[str]:
     for value in values:
         if isinstance(value, str) and value.strip():
             return value.strip()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
     return None
 
 
@@ -828,6 +832,418 @@ def _merge_events(base: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any
     return merged
 
 
+def _map_ica_event_to_generic(raw_event: Dict[str, Any]) -> Optional[GenericMappedEventDict]:
+    name = _first_string(raw_event.get("name"), raw_event.get("title"))
+    if not name:
+        return None
+
+    source_url = _first_string(raw_event.get("url"), raw_event.get("source_url"), raw_event.get("sourceUrl"))
+    slug = _parse_slug_metadata(source_url or "")
+    location = raw_event.get("location") if isinstance(raw_event.get("location"), dict) else {}
+    address = location.get("address") if isinstance(location.get("address"), dict) else {}
+    organizer = raw_event.get("organizer") if isinstance(raw_event.get("organizer"), dict) else {}
+    ica = (
+        raw_event.get("internationalConferenceAlerts")
+        if isinstance(raw_event.get("internationalConferenceAlerts"), dict)
+        else {}
+    )
+    categories = raw_event.get("categories") if isinstance(raw_event.get("categories"), list) else []
+
+    city = _first_string(
+        address.get("addressLocality"),
+        raw_event.get("city"),
+        ica.get("city"),
+        slug.get("city"),
+        location.get("name"),
+    )
+    country = _first_string(
+        address.get("addressCountry"),
+        raw_event.get("country"),
+        ica.get("country"),
+    )
+    latitude = _first_number(location.get("latitude"), raw_event.get("latitude"))
+    longitude = _first_number(location.get("longitude"), raw_event.get("longitude"))
+    venue_name = _first_string(location.get("name"))
+    category = _first_string(*(categories or []), raw_event.get("eventType"))
+    organizer_contact = _clean_ica_field(raw_event.get("organizerContact"), 240)
+    organizer_name = _clean_ica_organizer_name(_first_string(raw_event.get("organizerName"), organizer.get("name")))
+    organizer_email = _clean_ica_email(organizer.get("email"))
+    organizer_phone = _clean_ica_phone(organizer.get("telephone"))
+    if not organizer_contact:
+        organizer_contact = _first_string(
+            " | ".join(part for part in (organizer_email, organizer_phone) if part)
+        )
+    people: List[Dict[str, Any]] = []
+    for key, fallback_relationship in (
+        ("speakers", "SPEAKER"),
+        ("committeeMembers", "COMMITTEE MEMBER"),
+    ):
+        raw_people = raw_event.get(key) if isinstance(raw_event.get(key), list) else []
+        for person in raw_people:
+            if not isinstance(person, dict):
+                continue
+            person_name = _first_string(person.get("name"), person.get("fullName"))
+            if not person_name:
+                continue
+            people.append(
+                {
+                    "fullName": person_name,
+                    "title": _first_string(person.get("title")),
+                    "relationshipType": _clean_ica_relationship_type(person.get("relationshipType"), fallback_relationship),
+                    "metadataJson": {
+                        "sourceProvider": "international_conference_alerts",
+                        "person": person,
+                    },
+                }
+            )
+
+    occurrence: GenericOccurrenceDict = {
+        "locationText": _first_string(venue_name, address.get("streetAddress"), city),
+        "latitude": latitude,
+        "longitude": longitude,
+        "venueName": venue_name,
+        "streetAddress": _first_string(address.get("streetAddress")),
+        "city": city,
+        "region": _first_string(address.get("addressRegion")),
+        "postalCode": _first_string(address.get("postalCode")),
+        "country": country,
+        "timezone": _first_string(raw_event.get("timezone")),
+        "expectedAttendance": _first_int(raw_event.get("expectedAttendance")),
+    }
+    occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
+
+    metadata = _sanitize_ica_metadata(raw_event)
+
+    event: GenericMappedEventDict = {
+        "name": name,
+        "sourceUrl": source_url,
+        "startAt": _first_string(raw_event.get("startDate")),
+        "endAt": _first_string(raw_event.get("endDate")),
+        "city": city,
+        "country": country,
+        "eventType": _first_string(raw_event.get("eventType"), category, "Conference"),
+        "category": category,
+        "organizerName": organizer_name,
+        "organizerWebsite": _first_string(raw_event.get("organizerWebsite"), organizer.get("url")),
+        "organizerContact": organizer_contact,
+        "eventImageUrl": _first_string(raw_event.get("eventImageUrl"), _first_url_or_string(raw_event.get("image"))),
+        "industry": _first_string(raw_event.get("industry"), category),
+        "expectedAttendance": _first_int(raw_event.get("expectedAttendance")),
+        "description": _strip_html(raw_event.get("description")) or _first_string(raw_event.get("description")),
+        "sourceProvider": "international_conference_alerts",
+        "attendees": people,
+        "occurrence": occurrence,
+        "metadataJson": metadata,
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
+
+
+def _clean_spaces(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text or None
+
+
+_ICA_NOISE_BOUNDARY_PATTERN = re.compile(
+    r"\b(?:Find What Next|Similar Events|Explore Related Pages|Browse by|Subscribe to Event|Subscribe Now|Add to Calendar|Official Website|Top Countries|Top Cities|Popular Topics|Company About Us|Privacy Policy|Terms of Service|All rights reserved)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_ica_field(value: Any, max_length: Optional[int] = None) -> Optional[str]:
+    text = _clean_spaces(value)
+    if not text:
+        return None
+    text = _ICA_NOISE_BOUNDARY_PATTERN.split(text, maxsplit=1)[0].strip(" ,|-")
+    if max_length and len(text) > max_length:
+        return None
+    return text or None
+
+
+def _clean_ica_email(value: Any) -> Optional[str]:
+    text = _clean_ica_field(value, 200)
+    if not text:
+        return None
+    match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text)
+    if match:
+        return match.group(0)
+    if "[email protected]" in text.lower():
+        return "[email protected]"
+    return None
+
+
+def _clean_ica_phone(value: Any) -> Optional[str]:
+    text = _clean_ica_field(value, 80)
+    if not text:
+        return None
+    if not re.search(r"\d", text):
+        return None
+    return text
+
+
+def _clean_ica_organizer_name(value: Any) -> Optional[str]:
+    text = _clean_ica_field(value, 160)
+    if not text:
+        return None
+    has_email = bool(re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text) or "[email protected]" in text.lower())
+    text_without_email = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "", text)
+    text_without_email = re.sub(r"\[email protected\]", "", text_without_email, flags=re.IGNORECASE)
+    text_without_email = _clean_spaces(text_without_email) or text
+    first_word = text_without_email.split(" ", 1)[0]
+    if has_email and first_word.isupper() and 2 <= len(first_word) <= 12:
+        return first_word
+    return text_without_email
+
+
+def _clean_ica_relationship_type(value: Any, fallback: str) -> str:
+    relationship = _first_string(value, fallback) or fallback
+    return relationship.replace("_", " ")
+
+
+def _clean_ica_month(value: Any) -> Optional[str]:
+    text = _clean_ica_field(value, 40)
+    if not text:
+        return None
+    yyyymm_match = re.search(r"\b(20\d{2})(0[1-9]|1[0-2])\b", text)
+    if yyyymm_match:
+        return f"{yyyymm_match.group(1)}-{yyyymm_match.group(2)}"
+    month_match = re.search(
+        r"\b(January|February|March|April|May|June|July|August|September|October|November|December)(?:[-\s,]+(20\d{2}))?\b",
+        text,
+        re.IGNORECASE,
+    )
+    if month_match:
+        month_name = month_match.group(1).title()
+        year = month_match.group(2)
+        return f"{month_name} {year}" if year else month_name
+    return text
+
+
+def _sanitize_ica_metadata(raw_event: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = {
+        **raw_event,
+        "sourceProvider": "international_conference_alerts",
+    }
+    organizer = metadata.get("organizer") if isinstance(metadata.get("organizer"), dict) else None
+    if organizer is not None:
+        clean_organizer = {**organizer}
+        clean_organizer["name"] = _clean_ica_organizer_name(clean_organizer.get("name"))
+        clean_organizer["email"] = _clean_ica_email(clean_organizer.get("email"))
+        clean_organizer["telephone"] = _clean_ica_phone(clean_organizer.get("telephone"))
+        metadata["organizer"] = {key: value for key, value in clean_organizer.items() if value not in (None, "", [], {})}
+
+    ica = metadata.get("internationalConferenceAlerts")
+    if isinstance(ica, dict):
+        clean_ica = {**ica}
+        clean_ica["month"] = _clean_ica_month(clean_ica.get("month"))
+        quick_info = clean_ica.get("quickInfo")
+        if isinstance(quick_info, dict):
+            clean_quick_info = {**quick_info}
+            clean_quick_info["month"] = _clean_ica_month(clean_quick_info.get("month"))
+            clean_quick_info["venue"] = _clean_ica_field(clean_quick_info.get("venue"), 300)
+            clean_ica["quickInfo"] = {
+                key: value for key, value in clean_quick_info.items() if value not in (None, "", [], {})
+            }
+        metadata["internationalConferenceAlerts"] = {
+            key: value for key, value in clean_ica.items() if value not in (None, "", [], {})
+        }
+    return metadata
+
+
+def _meta_content(soup: BeautifulSoup, *selectors: Tuple[str, str]) -> Optional[str]:
+    for attr, value in selectors:
+        tag = soup.find("meta", attrs={attr: value})
+        content = tag.get("content") if tag else None
+        text = _clean_spaces(content)
+        if text:
+            return text
+    return None
+
+
+def _text_after_label(text: str, label: str) -> Optional[str]:
+    pattern = re.compile(
+        rf"{re.escape(label)}\s*:?\s*(.+?)(?=\s+(?:Start Date|End Date|Registration Deadline|Submission Deadline|Organizer Details|Organized By|Organizer|Contact Person|Event Enquiries|Phone|Call|Conference Agenda|Committee Members|Advisory Committee|Speakers|Indexed In|Quick Info|Type|Country|Month|Venue|Find What Next|Similar Events|Explore Related Pages|Browse by|Subscribe|Official Website)\b|$)",
+        re.IGNORECASE,
+    )
+    match = pattern.search(text)
+    return _clean_ica_field(match.group(1)) if match else None
+
+
+def _collect_people_after_heading(soup: BeautifulSoup, heading_pattern: str, relationship_type: str) -> List[Dict[str, Any]]:
+    heading = soup.find(
+        ["h1", "h2", "h3", "h4", "h5"],
+        string=lambda value: bool(value and re.search(heading_pattern, value, re.IGNORECASE)),
+    )
+    if not heading:
+        return []
+
+    people: List[Dict[str, Any]] = []
+    for node in heading.find_all_next(["h2", "h3", "h4", "h5"]):
+        title = _clean_spaces(node.get_text(" ", strip=True))
+        if not title:
+            continue
+        if re.search(
+            r"^(Organizer|Organizer Details|Indexed In|Quick Info|Conference Agenda|Important Dates|Venue|Objective of the Conference|Speakers?|Committee Members?|Advisory Committee)$",
+            title,
+            re.IGNORECASE,
+        ):
+            break
+        detail_parts: List[str] = []
+        sibling = node.find_next_sibling()
+        while sibling and len(detail_parts) < 4:
+            if getattr(sibling, "name", None) in {"h1", "h2", "h3", "h4", "h5"}:
+                break
+            sibling_text = _clean_spaces(sibling.get_text(" ", strip=True))
+            if sibling_text:
+                detail_parts.append(sibling_text)
+            sibling = sibling.find_next_sibling()
+        detail_text = _clean_spaces(" ".join(detail_parts)) or ""
+        if title.lower() in {"speakers", "committee members"}:
+            continue
+        people.append(
+            {
+                "name": title,
+                "title": detail_text[:300] or None,
+                "relationshipType": relationship_type,
+            }
+        )
+        if len(people) >= 50:
+            break
+    return people
+
+
+def _extract_agenda_rows(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for table in soup.find_all("table"):
+        headers = [
+            _clean_spaces(cell.get_text(" ", strip=True)) or ""
+            for cell in table.find_all("th")
+        ]
+        header_text = " ".join(headers).lower()
+        if headers and not ("timing" in header_text or "session" in header_text):
+            continue
+        for tr in table.find_all("tr"):
+            cells = [
+                _clean_spaces(cell.get_text(" ", strip=True)) or ""
+                for cell in tr.find_all(["td", "th"])
+            ]
+            if len(cells) < 2 or cells[0].lower() == "timing":
+                continue
+            rows.append({"time": cells[0], "session": cells[1]})
+    return rows
+
+
+def _extract_ica_detail_html_event(html: str, source_url: str) -> Optional[Dict[str, Any]]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    clean_source_url = _clean_url(source_url)
+    slug = _parse_slug_metadata(clean_source_url)
+    text = _clean_spaces(soup.get_text(" ", strip=True)) or ""
+    if not text or "just a moment" in text.lower():
+        return None
+
+    raw_title = _first_string(
+        _meta_content(soup, ("property", "og:title"), ("name", "twitter:title")),
+        soup.find("h1").get_text(" ", strip=True) if soup.find("h1") else None,
+        soup.title.get_text(" ", strip=True) if soup.title else None,
+    )
+    title = re.sub(r"\s*(?:\||-)\s*International Conference Alerts.*$", "", raw_title or "").strip()
+    description = _first_string(
+        _meta_content(soup, ("name", "description"), ("property", "og:description")),
+        _text_after_label(text, "Objective of the Conference"),
+    )
+
+    start_date = _first_string(_text_after_label(text, "Start Date"))
+    end_date = _first_string(_text_after_label(text, "End Date"))
+    registration_deadline = _first_string(_text_after_label(text, "Registration Deadline"))
+    submission_deadline = _first_string(_text_after_label(text, "Submission Deadline"))
+    event_type = _first_string(_text_after_label(text, "Type"), "Conference")
+    country = _first_string(_text_after_label(text, "Country"), slug.get("country"))
+    month = _clean_ica_month(_text_after_label(text, "Month")) or _clean_ica_month(slug.get("month"))
+    venue_text = _clean_ica_field(_text_after_label(text, "Venue"), 300)
+
+    organizer_name = _clean_ica_organizer_name(
+        _first_string(
+            _text_after_label(text, "Organized By"),
+            _text_after_label(text, "Organizer"),
+        )
+    )
+    contact_person = _clean_ica_field(_text_after_label(text, "Contact Person"), 120)
+    organizer_email = _clean_ica_email(_text_after_label(text, "Event Enquiries"))
+    organizer_phone = _clean_ica_phone(_first_string(_text_after_label(text, "Phone"), _text_after_label(text, "Call")))
+    organizer_contact = _clean_ica_field(
+        " | ".join(part for part in (contact_person, organizer_email, organizer_phone) if part),
+        240,
+    )
+
+    if not organizer_name:
+        organizer_name = _clean_ica_organizer_name(_text_after_label(text, "Organized By"))
+
+    location = _normalize_location({"name": venue_text or slug.get("city")})
+    if slug.get("city"):
+        location["address"] = {
+            **(location.get("address") if isinstance(location.get("address"), dict) else {}),
+            "addressLocality": slug.get("city"),
+        }
+    if country:
+        location["address"] = {
+            **(location.get("address") if isinstance(location.get("address"), dict) else {}),
+            "addressCountry": country,
+        }
+
+    speakers = _collect_people_after_heading(soup, r"\bSpeakers?\b", "SPEAKER")
+    committee_members = _collect_people_after_heading(soup, r"\bCommittee Members?\b|Advisory Committee", "COMMITTEE MEMBER")
+    agenda = _extract_agenda_rows(soup)
+
+    event = {
+        "@type": "Event",
+        "id": slug.get("id") or clean_source_url,
+        "name": title or slug.get("acronym") or clean_source_url,
+        "title": title or slug.get("acronym") or clean_source_url,
+        "url": clean_source_url,
+        "source_url": clean_source_url,
+        "startDate": start_date,
+        "endDate": end_date,
+        "description": description,
+        "location": location,
+        "organizer": {
+            "@type": "Organization",
+            "name": organizer_name,
+            "email": organizer_email,
+            "telephone": organizer_phone,
+        },
+        "organizerName": organizer_name,
+        "organizerContact": organizer_contact,
+        "country": country,
+        "eventType": event_type,
+        "speakers": speakers,
+        "committeeMembers": committee_members,
+        "internationalConferenceAlerts": {
+            "source": "detail_html_sections",
+            "slug": slug.get("slug"),
+            "acronym": slug.get("acronym"),
+            "month": month,
+            "importantDates": {
+                "registrationDeadline": registration_deadline,
+                "submissionDeadline": submission_deadline,
+            },
+            "agenda": agenda,
+            "quickInfo": {
+                "type": event_type,
+                "country": country,
+                "month": month,
+                "venue": venue_text,
+            },
+            "contactPerson": contact_person,
+        },
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}
+
+
+def _map_ica_events_to_generic(events: List[Dict[str, Any]]) -> List[GenericMappedEventDict]:
+    return [mapped for event in events if (mapped := _map_ica_event_to_generic(event))]
+
+
 async def _fetch_detail_event_browser(url: str, proxy_url: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     clean_url = _clean_url(url)
     cached = _cached_events.get(clean_url)
@@ -853,11 +1269,16 @@ async def _fetch_detail_event_browser(url: str, proxy_url: Optional[str] = None)
             if _cloudflare_blocked(html, 403):
                 return slug_fallback, {"source": "browser_detail_fetch", "url": clean_url, "reason": "cloudflare_managed_challenge"}
             extracted = _extract_json_ld_events(html, clean_url)
+            section_event = _extract_ica_detail_html_event(html, clean_url)
             if extracted:
-                return (_merge_events(cached, extracted[0]) if cached else extracted[0]), None
+                detail = _merge_events(extracted[0], section_event) if section_event else extracted[0]
+                return (_merge_events(cached, detail) if cached else detail), None
             fallback = _extract_meta_fallback_event(html, clean_url)
             if fallback:
-                return (_merge_events(cached, fallback) if cached else fallback), None
+                detail = _merge_events(fallback, section_event) if section_event else fallback
+                return (_merge_events(cached, detail) if cached else detail), None
+            if section_event:
+                return (_merge_events(cached, section_event) if cached else section_event), None
             return slug_fallback, {"source": "browser_detail_parse", "url": clean_url, "reason": "no_json_ld_or_meta_event_found"}
     except Exception as error:
         return slug_fallback, {"source": "browser_detail_fetch", "url": clean_url, "reason": str(error)}
@@ -910,11 +1331,16 @@ async def _fetch_detail_event(client: httpx.AsyncClient, url: str, proxy_url: Op
         html = unlocked_html or ""
 
     extracted = _extract_json_ld_events(html, clean_url)
+    section_event = _extract_ica_detail_html_event(html, clean_url)
     if extracted:
-        return (_merge_events(cached, extracted[0]) if cached else extracted[0]), None
+        detail = _merge_events(extracted[0], section_event) if section_event else extracted[0]
+        return (_merge_events(cached, detail) if cached else detail), None
     fallback = _extract_meta_fallback_event(html, clean_url)
     if fallback:
-        return (_merge_events(cached, fallback) if cached else fallback), None
+        detail = _merge_events(fallback, section_event) if section_event else fallback
+        return (_merge_events(cached, detail) if cached else detail), None
+    if section_event:
+        return (_merge_events(cached, section_event) if cached else section_event), None
     return slug_fallback, {"source": "detail_parse", "url": clean_url, "reason": "no_json_ld_or_meta_event_found"}
 
 
@@ -1114,7 +1540,11 @@ async def crawl_ica_events_with_diagnostics(
                     radius_km=radius_km,
                     geocode=geocode,
                 )
-                return {"events": filtered, "parse_failures": [*parse_failures, *radius_failures], "diagnostics": {**diagnostics, "radius": radius_diag}}
+                return {
+                    "events": _map_ica_events_to_generic(filtered),
+                    "parse_failures": [*parse_failures, *radius_failures],
+                    "diagnostics": {**diagnostics, "radius": radius_diag},
+                }
 
         if source in ("auto", "html") and len(events) < limit:
             html_urls, html_failures = await _search_html_urls(client=client, search_url=resolved_url, limit=limit)
@@ -1175,7 +1605,7 @@ async def crawl_ica_events_with_diagnostics(
     parse_failures.extend(radius_failures)
     diagnostics["radius"] = radius_diag
     diagnostics["final_count_before_radius"] = len(deduped)
-    return {"events": filtered[:limit], "parse_failures": parse_failures, "diagnostics": diagnostics}
+    return {"events": _map_ica_events_to_generic(filtered[:limit]), "parse_failures": parse_failures, "diagnostics": diagnostics}
 
 
 async def preview_ica_events(
@@ -1231,100 +1661,15 @@ async def ingest_ica_events_to_eagle(
     diagnostics: Optional[Dict[str, Any]] = None,
     persist: bool = False,
 ) -> Dict[str, Any]:
-    eagle_api_base_url = os.getenv("EAGLE_API_BASE_URL", DEFAULT_EAGLE_API_BASE_URL).rstrip("/")
-    endpoint_url = f"{eagle_api_base_url}/scraper/events/ica-import"
-    batch_size = max(1, int(os.getenv("EAGLE_IMPORT_BATCH_SIZE", str(DEFAULT_EAGLE_IMPORT_BATCH_SIZE))))
-    parse_failures = parse_failures or []
-    diagnostics = diagnostics or {}
-    results: List[Dict[str, Any]] = []
-    failures: List[Dict[str, Any]] = []
-
-    if not persist:
-        return {
-            "mode": "preview",
-            "eagle_ingest_url": endpoint_url,
-            "eagle_endpoint_url": endpoint_url,
-            "crawled_count": len(events),
-            "normalized_count": len(events),
-            "ingested_count": 0,
-            "created_count": 0,
-            "updated_count": 0,
-            "skipped_count": 0,
-            "failed_count": len(parse_failures),
-            "events": events,
-            "results": [],
-            "failures": [],
-            "parse_failures": parse_failures,
-            "diagnostics": diagnostics,
-        }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        for start in range(0, len(events), batch_size):
-            batch = [_sanitize_ica_event_for_eagle(event) for event in events[start : start + batch_size]]
-            payload: Dict[str, Any] = {
-                "events": batch,
-                "parseFailures": parse_failures,
-            }
-            if organization_id:
-                payload["organizationId"] = organization_id
-            if workspace_id:
-                payload["workspaceId"] = workspace_id
-
-            batch_meta = {
-                "batch_start": start,
-                "batch_end": start + len(batch) - 1,
-                "event_count": len(batch),
-                "source_urls": [
-                    event.get("url") or event.get("source_url") or event.get("sourceUrl")
-                    for event in batch[:5]
-                ],
-            }
-            try:
-                response = await client.post(endpoint_url, json=payload)
-                response.raise_for_status()
-                eagle_response = response.json()
-                results.append({**batch_meta, "eagle_response": eagle_response})
-                eagle_data = eagle_response.get("data") if isinstance(eagle_response.get("data"), dict) else eagle_response
-                failures.extend(eagle_data.get("failures") or [])
-            except httpx.HTTPStatusError as error:
-                failures.append({**batch_meta, "status_code": error.response.status_code, "response": error.response.text})
-            except Exception as error:
-                failures.append({**batch_meta, "error": str(error)})
-
-    imported_count = 0
-    created_count = 0
-    updated_count = 0
-    skipped_count = 0
-    speakers_created = 0
-    speakers_linked = 0
-    for result in results:
-        eagle_response = result.get("eagle_response", {})
-        eagle_data = eagle_response.get("data") if isinstance(eagle_response.get("data"), dict) else eagle_response
-        imported_count += int(eagle_data.get("count") or 0)
-        created_count += int(eagle_data.get("created") or 0)
-        updated_count += int(eagle_data.get("updated") or 0)
-        skipped_count += int(eagle_data.get("skipped") or 0)
-        speakers_created += int(eagle_data.get("speakersCreated") or 0)
-        speakers_linked += int(eagle_data.get("speakersLinked") or 0)
-
-    return {
-        "mode": "persist",
-        "eagle_ingest_url": endpoint_url,
-        "eagle_endpoint_url": endpoint_url,
-        "crawled_count": len(events),
-        "normalized_count": imported_count,
-        "ingested_count": imported_count,
-        "created_count": created_count,
-        "updated_count": updated_count,
-        "skipped_count": skipped_count,
-        "failed_count": len(failures),
-        "events": events,
-        "results": results,
-        "failures": failures,
-        "parse_failures": parse_failures,
-        "diagnostics": {
-            **diagnostics,
-            "speakersCreated": speakers_created,
-            "speakersLinked": speakers_linked,
-        },
-    }
+    response = await ingest_generic_events_to_eagle(
+        organization_id=organization_id,
+        workspace_id=workspace_id,
+        events=events,
+        source_provider="international_conference_alerts",
+        parse_failures=parse_failures,
+        persist=persist,
+        already_mapped=True,
+    )
+    if diagnostics:
+        response["diagnostics"] = diagnostics
+    return response

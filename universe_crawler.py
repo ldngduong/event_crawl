@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericMappedEventDict, GenericOccurrenceDict
 
 import httpx
 
@@ -53,6 +54,7 @@ fragment EventFragment on Event {
   }
   coverPhoto {
     id
+    fullUrl: url
     url(height: $height, width: $width, quality: LIGHTEST)
     webpUrl: url(height: $height, width: $width, quality: LIGHTEST, format: WEBP)
   }
@@ -143,6 +145,7 @@ query CacheableEvent($id: ID!) {
       state
     }
     coverPhoto {
+      fullUrl: url
       url(height: 1200)
       uploadId
     }
@@ -162,7 +165,7 @@ query CacheableEvent($id: ID!) {
     }
     allImages {
       url
-      fullUrl: url(height: 800, width: 1350, cropMode:PREVIEW)
+      fullUrl: url
     }
     timezone
     ageLimit
@@ -184,9 +187,36 @@ UNIVERSE_LOCATION_PRESETS: Dict[str, Tuple[str, float, float]] = {
 def _strip_html(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
-    text = re.sub(r"<[^>]+>", " ", value)
-    text = re.sub(r"\s+", " ", unescape(text)).strip()
+    text = value
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
+    text = re.sub(r"(?i)</\s*(p|div|h[1-6]|blockquote|ul|ol)\s*>", "\n\n", text)
+    text = re.sub(r"(?i)<\s*li[^>]*>", "\n- ", text)
+    text = re.sub(r"(?i)</\s*li\s*>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    cleaned_lines: List[str] = []
+    previous_blank = False
+    for line in lines:
+        if not line:
+            if not previous_blank and cleaned_lines:
+                cleaned_lines.append("")
+            previous_blank = True
+            continue
+        cleaned_lines.append(line)
+        previous_blank = False
+    text = "\n".join(cleaned_lines).strip()
     return text or None
+
+
+def _full_universe_image_url(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -194,6 +224,15 @@ def _as_float(value: Any) -> Optional[float]:
         if value is None or value == "":
             return None
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
     except (TypeError, ValueError):
         return None
 
@@ -294,7 +333,9 @@ def _compact_universe_search_event(event: Dict[str, Any]) -> Dict[str, Any]:
         "slug": slug,
         "startDate": timeslot.get("startAt"),
         "endDate": timeslot.get("endAt"),
-        "image": cover_photo.get("url") or cover_photo.get("webpUrl"),
+        "image": _full_universe_image_url(
+            cover_photo.get("fullUrl") or cover_photo.get("url") or cover_photo.get("webpUrl")
+        ),
         "description": title,
         "location": {
             "name": geo.get("city"),
@@ -334,6 +375,7 @@ def _compact_universe_detail_event(event: Dict[str, Any]) -> Dict[str, Any]:
     user = event.get("user") if isinstance(event.get("user"), dict) else {}
     tags = event.get("tags") if isinstance(event.get("tags"), list) else []
     cover_photo = event.get("coverPhoto") if isinstance(event.get("coverPhoto"), dict) else {}
+    all_images = event.get("allImages") if isinstance(event.get("allImages"), list) else []
     slug_param = event.get("slugParam") if isinstance(event.get("slugParam"), str) else None
     slug = event.get("slug") if isinstance(event.get("slug"), str) else None
     source_url = _event_url_from_slug_param(slug_param, slug)
@@ -363,7 +405,18 @@ def _compact_universe_detail_event(event: Dict[str, Any]) -> Dict[str, Any]:
         "startDate": first_time_slot.get("startAt"),
         "endDate": first_time_slot.get("endAt"),
         "timezone": event.get("timezone"),
-        "image": cover_photo.get("url"),
+        "image": _full_universe_image_url(
+            cover_photo.get("fullUrl")
+            or cover_photo.get("url")
+            or next(
+                (
+                    image.get("fullUrl") or image.get("url")
+                    for image in all_images
+                    if isinstance(image, dict) and (image.get("fullUrl") or image.get("url"))
+                ),
+                None,
+            )
+        ),
         "description": _strip_html(event.get("description")),
         "location": location,
         "organizer": {
@@ -404,6 +457,77 @@ def _merge_universe_events(base: Dict[str, Any], detail: Dict[str, Any]) -> Dict
                 **(detail.get(key) if isinstance(detail.get(key), dict) else {}),
             }
     return merged
+
+
+def _read_record(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _first_string(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+    return None
+
+
+def _map_universe_event_to_generic(raw_event: Dict[str, Any]) -> Optional[GenericMappedEventDict]:
+    name = _first_string(raw_event.get("name"), raw_event.get("title"))
+    if not name:
+        return None
+
+    location = _read_record(raw_event.get("location"))
+    address = _read_record(location.get("address"))
+    organizer = _read_record(raw_event.get("organizer"))
+    offers = _read_record(raw_event.get("offers"))
+
+    city = _first_string(address.get("addressLocality"), location.get("city"), raw_event.get("city"))
+    country = _first_string(address.get("addressCountry"), location.get("country"), raw_event.get("country"))
+    latitude = _as_float(raw_event.get("latitude") or location.get("latitude"))
+    longitude = _as_float(raw_event.get("longitude") or location.get("longitude"))
+    categories = raw_event.get("categories") if isinstance(raw_event.get("categories"), list) else []
+    category = _first_string(*(categories or []), raw_event.get("eventType"))
+
+    occurrence: GenericOccurrenceDict = {
+        "locationText": _first_string(location.get("name"), address.get("streetAddress"), city),
+        "latitude": latitude,
+        "longitude": longitude,
+        "venueName": _first_string(location.get("name")),
+        "streetAddress": _first_string(address.get("streetAddress")),
+        "city": city,
+        "region": _first_string(address.get("addressRegion")),
+        "country": country,
+        "timezone": _first_string(raw_event.get("timezone")),
+    }
+    occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
+
+    metadata = {
+        **raw_event,
+        "sourceProvider": "universe",
+        "offers": offers,
+    }
+
+    event: GenericMappedEventDict = {
+        "name": name,
+        "sourceUrl": _first_string(raw_event.get("url"), raw_event.get("source_url")),
+        "startAt": _first_string(raw_event.get("startDate")),
+        "endAt": _first_string(raw_event.get("endDate")),
+        "city": city,
+        "country": country,
+        "eventType": _first_string(raw_event.get("eventType"), category, "Event"),
+        "category": category,
+        "organizerName": _first_string(organizer.get("name")),
+        "organizerWebsite": _first_string(organizer.get("url")),
+        "organizerContact": _first_string(organizer.get("email"), organizer.get("phone")),
+        "eventImageUrl": _full_universe_image_url(_first_string(raw_event.get("image"))),
+        "industry": category,
+        "description": _strip_html(raw_event.get("description")) or _first_string(raw_event.get("description")),
+        "sourceProvider": "universe",
+        "occurrence": occurrence,
+        "metadataJson": metadata,
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
 
 
 def _strip_large_universe_payload(value: Any) -> Any:
@@ -542,7 +666,8 @@ async def crawl_universe_events_with_diagnostics(
     parse_failures.extend(failures)
 
     if not enrich_details or not events:
-        return {"events": events[:limit], "parse_failures": parse_failures}
+        mapped_events = [mapped for event in events[:limit] if (mapped := _map_universe_event_to_generic(event))]
+        return {"events": mapped_events, "parse_failures": parse_failures}
 
     enriched_events: List[Dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=45, headers=UNIVERSE_HEADERS, follow_redirects=True) as client:
@@ -578,7 +703,7 @@ async def crawl_universe_events_with_diagnostics(
         deduped[key] = event
 
     return {
-        "events": list(deduped.values())[:limit],
+        "events": [mapped for event in list(deduped.values())[:limit] if (mapped := _map_universe_event_to_generic(event))],
         "parse_failures": parse_failures,
     }
 
@@ -605,4 +730,5 @@ async def ingest_universe_events_to_eagle(
         source_provider="universe",
         parse_failures=parse_failures,
         persist=persist,
+        already_mapped=True,
     )

@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 import json
 
 from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericAttendeeDict, GenericCompanyDict, GenericMappedEventDict, GenericOccurrenceDict
 
 # Tắt log INFO mặc định của httpx để đỡ rác màn hình
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -24,6 +25,43 @@ def parse_conferank_location(loc_str: str) -> tuple[str, str]:
     city = parts[0].strip() if len(parts) > 0 else ""
     country = parts[1].strip() if len(parts) > 1 else ""
     return city, country
+
+def _first_string(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+    return None
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        try:
+            if value is not None and str(value).strip() != "":
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def _is_placeholder_speaker_name(name: Optional[str]) -> bool:
+    if not name:
+        return True
+    normalized = name.strip().lower()
+    return normalized in {
+        "speaker",
+        "speakers",
+        "speakers coming soon",
+        "coming soon",
+        "to be announced",
+        "tba",
+        "tbd",
+    }
+
+def _has_speaker_details(speaker: Dict[str, Any]) -> bool:
+    name = _first_string(speaker.get("name"))
+    if _is_placeholder_speaker_name(name):
+        return False
+    return bool(_first_string(speaker.get("role"), speaker.get("linkedin")))
 
 async def enrich_event_details(client: httpx.AsyncClient, event_url: str) -> Dict[str, Any]:
     enriched_data = {}
@@ -141,7 +179,7 @@ async def enrich_event_details(client: httpx.AsyncClient, event_url: str) -> Dic
                         if linkedin_a:
                             linkedin_url = linkedin_a['href']
                         speaker_obj = {"name": name, "role": role, "linkedin": linkedin_url}
-                        if speaker_obj not in speakers:
+                        if _has_speaker_details(speaker_obj) and speaker_obj not in speakers:
                             speakers.append(speaker_obj)
                 if speakers:
                     enriched_data['speakers'] = speakers
@@ -285,12 +323,15 @@ async def crawl_conferank_events(
                         if "speakers" in enriched:
                             speaker_lines = []
                             for s in enriched["speakers"]:
+                                if not _has_speaker_details(s):
+                                    continue
                                 line = f"• {s['name']}"
                                 if s['role']: line += f" ({s['role']})"
                                 if s['linkedin']: line += f" [LinkedIn: {s['linkedin']}]"
                                 speaker_lines.append(line)
-                            speakers_str = "**Speakers**\n" + "\n".join(speaker_lines)
-                            desc_parts.append(speakers_str)
+                            if speaker_lines:
+                                speakers_str = "**Speakers**\n" + "\n".join(speaker_lines)
+                                desc_parts.append(speakers_str)
                         if "sponsors" in enriched:
                             sponsor_lines = []
                             for s in enriched["sponsors"]:
@@ -311,7 +352,97 @@ async def crawl_conferank_events(
             await asyncio.gather(*(process_event(ev) for ev in events_data))
             
     logger.info(f"Đã cào thành công {len(events_data)} sự kiện từ danh sách!")
-    return events_data
+    return [mapped for event in events_data if (mapped := _map_conferank_event_to_generic(event))]
+
+def _map_conferank_event_to_generic(raw_event: Dict[str, Any]) -> Optional[GenericMappedEventDict]:
+    name = _first_string(raw_event.get("name"), raw_event.get("title"))
+    if not name:
+        return None
+
+    location = raw_event.get("location") if isinstance(raw_event.get("location"), dict) else {}
+    address = location.get("address") if isinstance(location.get("address"), dict) else {}
+    offers = raw_event.get("offers") if isinstance(raw_event.get("offers"), dict) else {}
+    enriched = raw_event.get("enriched_details") if isinstance(raw_event.get("enriched_details"), dict) else {}
+    categories = raw_event.get("keywords") if isinstance(raw_event.get("keywords"), list) else []
+
+    venue_name = _first_string(location.get("name"), enriched.get("venue_name"))
+    street_address = _first_string(address.get("streetAddress"), enriched.get("venue_address"))
+    city = _first_string(address.get("addressLocality"))
+    country = _first_string(address.get("addressCountry"))
+
+    speakers = enriched.get("speakers") if isinstance(enriched.get("speakers"), list) else []
+    attendees: List[GenericAttendeeDict] = []
+    for speaker in speakers:
+        if not isinstance(speaker, dict):
+            continue
+        speaker_name = _first_string(speaker.get("name"))
+        if not speaker_name or not _has_speaker_details(speaker):
+            continue
+        attendees.append(
+            {
+                "fullName": speaker_name,
+                "title": _first_string(speaker.get("role")),
+                "linkedInUrl": _first_string(speaker.get("linkedin")),
+                "relationshipType": "SPEAKER",
+                "metadataJson": {"sourceProvider": "conferank", "speaker": speaker},
+            }
+        )
+
+    sponsors = enriched.get("sponsors") if isinstance(enriched.get("sponsors"), list) else []
+    companies: List[GenericCompanyDict] = []
+    for sponsor in sponsors:
+        if not isinstance(sponsor, dict):
+            continue
+        sponsor_name = _first_string(sponsor.get("name"))
+        if not sponsor_name:
+            continue
+        companies.append(
+            {
+                "name": sponsor_name,
+                "websiteUrl": _first_string(sponsor.get("website")),
+                "relationshipType": _first_string(sponsor.get("tier"), "Sponsor"),
+                "metadataJson": {"sourceProvider": "conferank", "sponsor": sponsor},
+            }
+        )
+
+    occurrence: GenericOccurrenceDict = {
+        "locationText": _first_string(venue_name, street_address, city),
+        "latitude": _first_float(location.get("latitude"), enriched.get("latitude")),
+        "longitude": _first_float(location.get("longitude"), enriched.get("longitude")),
+        "venueName": venue_name,
+        "streetAddress": street_address,
+        "city": city,
+        "country": country,
+    }
+    occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
+
+    category = _first_string(*(categories or []))
+    industry = ", ".join(str(item).strip() for item in categories if str(item).strip()) or category
+    metadata = {
+        **raw_event,
+        "sourceProvider": "conferank",
+        "offers": offers,
+    }
+
+    event: GenericMappedEventDict = {
+        "name": name,
+        "sourceUrl": _first_string(raw_event.get("url"), raw_event.get("source_url"), raw_event.get("sourceUrl")),
+        "startAt": _first_string(raw_event.get("startDate")),
+        "endAt": _first_string(raw_event.get("endDate")),
+        "city": city,
+        "country": country,
+        "eventType": _first_string(raw_event.get("eventType"), category, "Conference"),
+        "category": category,
+        "eventImageUrl": _first_string(raw_event.get("image"), raw_event.get("eventImageUrl")),
+        "industry": industry,
+        "description": _first_string(raw_event.get("description")),
+        "sourceProvider": "conferank",
+        "attendees": attendees,
+        "companies": companies,
+        "occurrence": occurrence,
+        "metadataJson": metadata,
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
 
 async def ingest_conferank_events_to_eagle(
     *,
@@ -329,6 +460,7 @@ async def ingest_conferank_events_to_eagle(
         source_provider="conferank",
         parse_failures=parse_failures,
         persist=persist,
+        already_mapped=True,
     )
     if diagnostics:
         response["diagnostics"] = diagnostics
@@ -338,56 +470,9 @@ if __name__ == "__main__":
     import asyncio
     async def test():
         events = await crawl_conferank_events(limit=100, enrich_details=False)
-        blackhat = next((ev for ev in events if 'blackhat' in ev['url'].lower()), None)
+        blackhat = next((ev for ev in events if 'blackhat' in (ev.get('sourceUrl') or '').lower()), None)
         
         if blackhat:
-            import httpx
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                enriched = await enrich_event_details(client, blackhat['url'])
-                if enriched:
-                    blackhat["enriched_details"] = enriched
-                    
-                    if "venue_name" in enriched:
-                        blackhat["location"]["name"] = enriched["venue_name"]
-                    if "venue_address" in enriched:
-                        blackhat["location"]["address"]["streetAddress"] = enriched["venue_address"]
-                    if "latitude" in enriched:
-                        blackhat["location"]["latitude"] = float(enriched["latitude"])
-                    if "longitude" in enriched:
-                        blackhat["location"]["longitude"] = float(enriched["longitude"])
-                        
-                    desc_parts = []
-                    if blackhat.get("description"):
-                        desc_parts.append(blackhat["description"])
-                        
-                    if "venue_features" in enriched:
-                        features_str = "**Venue Features**\n" + "\n".join([f"• {f}" for f in enriched["venue_features"]])
-                        desc_parts.append(features_str)
-                    if "speakers" in enriched:
-                        speaker_lines = []
-                        for s in enriched["speakers"]:
-                            line = f"• {s['name']}"
-                            if s['role']: line += f" ({s['role']})"
-                            if s['linkedin']: line += f" [LinkedIn: {s['linkedin']}]"
-                            speaker_lines.append(line)
-                        speakers_str = "**Speakers**\n" + "\n".join(speaker_lines)
-                        desc_parts.append(speakers_str)
-                    if "sponsors" in enriched:
-                        sponsor_lines = []
-                        for s in enriched["sponsors"]:
-                            line = f"• {s['name']} ({s['tier']})"
-                            if s['website']: line += f" [Website: {s['website']}]"
-                            if s['description']: line += f" - {s['description']}"
-                            sponsor_lines.append(line)
-                        sponsors_str = "**Sponsors**\n" + "\n".join(sponsor_lines)
-                        desc_parts.append(sponsors_str)
-                        
-                    if desc_parts:
-                        blackhat["description"] = "\n\n".join(desc_parts)
-                        
-                    blackhat["enriched_details"].pop("full_description", None)
-                    blackhat["enriched_details"].pop("extra_description", None)
-            
             print(json.dumps([blackhat], indent=2, ensure_ascii=False))
         else:
             print("Không tìm thấy Black Hat trong 100 sự kiện đầu tiên.")

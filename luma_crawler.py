@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 from generic_mapper import ingest_generic_events_to_eagle
+from schemas import GenericMappedEventDict, GenericOccurrenceDict
 
 import httpx
 
@@ -166,6 +167,59 @@ def _compact_luma_event(entry: Dict[str, Any], category: Optional[Dict[str, Any]
     }
 
 
+def _map_luma_event_to_generic(raw_event: Dict[str, Any]) -> Optional[GenericMappedEventDict]:
+    name = _first_string(raw_event.get("name"), raw_event.get("title"))
+    if not name:
+        return None
+
+    location = _read_record(raw_event.get("location"))
+    address = _read_record(location.get("address"))
+    geo = _read_record(location.get("geo"))
+    organizer = _read_record(raw_event.get("organizer"))
+    luma = _read_record(raw_event.get("luma"))
+
+    city = _first_string(address.get("addressLocality"), raw_event.get("city"))
+    country = _first_string(address.get("addressCountry"), raw_event.get("country"))
+    latitude = _as_float(raw_event.get("latitude") or geo.get("latitude"))
+    longitude = _as_float(raw_event.get("longitude") or geo.get("longitude"))
+
+    occurrence: GenericOccurrenceDict = {
+        "locationText": _first_string(location.get("name"), raw_event.get("address")),
+        "latitude": latitude,
+        "longitude": longitude,
+        "venueName": _first_string(location.get("name")),
+        "streetAddress": _first_string(address.get("streetAddress"), raw_event.get("address")),
+        "city": city,
+        "region": _first_string(address.get("addressRegion"), raw_event.get("region")),
+        "postalCode": _first_string(address.get("postalCode")),
+        "country": country,
+        "timezone": _first_string(raw_event.get("timezone")),
+        "expectedAttendance": _as_int(raw_event.get("expectedAttendance")),
+    }
+    occurrence = {key: value for key, value in occurrence.items() if value not in (None, "", [], {})}  # type: ignore
+
+    event: GenericMappedEventDict = {
+        "name": name,
+        "sourceUrl": _first_string(raw_event.get("url"), raw_event.get("source_url")),
+        "startAt": _first_string(raw_event.get("startDate")),
+        "endAt": _first_string(raw_event.get("endDate")),
+        "city": city,
+        "country": country,
+        "eventType": _first_string(raw_event.get("eventType"), raw_event.get("category"), "Event"),
+        "category": _first_string(raw_event.get("category")),
+        "organizerName": _first_string(organizer.get("name"), luma.get("calendarName")),
+        "organizerWebsite": _first_string(organizer.get("url"), luma.get("calendarWebsite")),
+        "eventImageUrl": _first_string(raw_event.get("image")),
+        "industry": _first_string(raw_event.get("category"), raw_event.get("eventType")),
+        "expectedAttendance": _as_int(raw_event.get("expectedAttendance")),
+        "description": _first_string(raw_event.get("description")),
+        "sourceProvider": "luma",
+        "occurrence": occurrence,
+        "metadataJson": {**raw_event, "sourceProvider": "luma"},
+    }
+    return {key: value for key, value in event.items() if value not in (None, "", [], {})}  # type: ignore
+
+
 async def _get_json(client: httpx.AsyncClient, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     response = await client.get(f"{LUMA_API_BASE_URL}{path}", params={k: v for k, v in params.items() if v is not None}, headers=LUMA_HEADERS)
     response.raise_for_status()
@@ -287,7 +341,8 @@ async def crawl_luma_events_with_diagnostics(
                     compact = _compact_luma_event(entry)
                     if compact:
                         events.append(compact)
-                return {"events": events[:limit], "parse_failures": failures, "diagnostics": diagnostics}
+                mapped_events = [mapped for event in events[:limit] if (mapped := _map_luma_event_to_generic(event))]
+                return {"events": mapped_events, "parse_failures": failures, "diagnostics": diagnostics}
 
             if not category_slug:
                 return {
@@ -372,7 +427,8 @@ async def crawl_luma_events_with_diagnostics(
         deduped[key] = event
 
     diagnostics["deduped_count"] = len(deduped)
-    return {"events": list(deduped.values())[:limit], "parse_failures": failures, "diagnostics": diagnostics}
+    mapped_events = [mapped for event in list(deduped.values())[:limit] if (mapped := _map_luma_event_to_generic(event))]
+    return {"events": mapped_events, "parse_failures": failures, "diagnostics": diagnostics}
 
 
 def _sanitize_luma_event_for_eagle(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -399,6 +455,7 @@ async def ingest_luma_events_to_eagle(
         source_provider="luma",
         parse_failures=parse_failures,
         persist=persist,
+        already_mapped=True,
     )
     if diagnostics:
         response["diagnostics"] = diagnostics
