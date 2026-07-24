@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, quote, unquote_plus, urljoin, urlparse
 
 from generic_mapper import ingest_generic_events_to_eagle
 from schemas import GenericMappedEventDict, GenericAttendeeDict, GenericOccurrenceDict
+from util.geocoding import text_to_coords
 
 import httpx
 from bs4 import BeautifulSoup
@@ -20,8 +21,6 @@ MeetupSource = Literal["auto", "api", "html"]
 MEETUP_BASE_URL = "https://www.meetup.com"
 MEETUP_GQL_URL = f"{MEETUP_BASE_URL}/gql2"
 MEETUP_DEFAULT_PAGE_SIZE = 30
-DEFAULT_EAGLE_API_BASE_URL = "http://localhost:3001/api/v1"
-DEFAULT_GEOCODING_URL = f"{DEFAULT_EAGLE_API_BASE_URL}/geocoding/address"
 DEFAULT_EAGLE_IMPORT_BATCH_SIZE = 10
 
 MEETUP_HEADERS = {
@@ -314,53 +313,6 @@ def _decode_location_slug(location: str) -> Tuple[str, Optional[str], Optional[s
 def _location_query(city: str, state: Optional[str], country: Optional[str]) -> str:
     return ", ".join(part for part in (city, state, country.upper() if country else None) if part)
 
-
-async def _geocode_location(query: str) -> Tuple[Optional[Tuple[float, float]], Optional[Dict[str, Any]]]:
-    eagle_api_base_url = os.getenv("EAGLE_API_BASE_URL", DEFAULT_EAGLE_API_BASE_URL).rstrip("/")
-    geocoding_url = os.getenv("EAGLE_GEOCODING_URL") or f"{eagle_api_base_url}/geocoding/address"
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as geocoding_client:
-            response = await geocoding_client.get(
-                geocoding_url,
-                params={"q": query},
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": MEETUP_HEADERS["User-Agent"],
-                },
-            )
-        response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data") if isinstance(payload, dict) else payload
-        if isinstance(data, dict) and isinstance(data.get("data"), dict):
-            data = data["data"]
-        lat = _first_number(
-            data.get("latitude") if isinstance(data, dict) else None,
-            data.get("lat") if isinstance(data, dict) else None,
-        )
-        lon = _first_number(
-            data.get("longitude") if isinstance(data, dict) else None,
-            data.get("lng") if isinstance(data, dict) else None,
-        )
-        if lat is not None and lon is not None:
-            return (lat, lon), {"geocoding_url": geocoding_url, "query": query, "status_code": response.status_code}
-        return None, {
-            "geocoding_url": geocoding_url,
-            "query": query,
-            "status_code": response.status_code,
-            "response": payload,
-            "reason": "geocoding_response_missing_lat_lon",
-        }
-    except Exception as error:
-        logger.warning("Meetup backend geocode failed query=%s error=%s", query, error)
-        status_code = getattr(getattr(error, "response", None), "status_code", None)
-        response_text = getattr(getattr(error, "response", None), "text", None)
-        return None, {
-            "geocoding_url": geocoding_url,
-            "query": query,
-            "status_code": status_code,
-            "response": response_text[:500] if isinstance(response_text, str) else None,
-            "reason": str(error),
-        }
 
 
 def _event_url_from_node(node: Dict[str, Any]) -> Optional[str]:
@@ -673,11 +625,9 @@ async def _search_meetup_api_events(
     async with httpx.AsyncClient(timeout=45, headers=MEETUP_HEADERS, follow_redirects=True) as client:
         if latitude is None or longitude is None:
             query = _location_query(city, state, country)
-            coords, geocoding_diagnostics = await _geocode_location(query)
+            coords = await text_to_coords(query)
             if coords:
                 latitude, longitude = coords
-        else:
-            geocoding_diagnostics = None
 
         if latitude is None or longitude is None:
             return [], [
@@ -685,8 +635,7 @@ async def _search_meetup_api_events(
                     "reason": "missing_lat_lon_for_meetup_search",
                     "location": location,
                     "resolved_location_query": _location_query(city, state, country),
-                    "geocoding": geocoding_diagnostics,
-                    "hint": "Backend geocoding must return latitude/longitude for this Meetup location.",
+                    "hint": "Geocoding must return latitude/longitude for this Meetup location.",
                 }
             ]
 
