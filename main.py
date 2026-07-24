@@ -9,7 +9,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, unquote_plus, urlparse
 from schemas import (
@@ -44,17 +44,6 @@ from meetup_crawler import (
     crawl_meetup_events_with_diagnostics,
     ingest_meetup_events_to_eagle,
 )
-try:
-    from stubhub_crawler import (
-        crawl_stubhub_events_with_diagnostics,
-        ingest_stubhub_events_to_eagle,
-    )
-except ModuleNotFoundError:
-    async def crawl_stubhub_events_with_diagnostics(**_: object):
-        raise HTTPException(status_code=501, detail="stubhub_crawler.py is not available")
-
-    async def ingest_stubhub_events_to_eagle(**_: object):
-        raise HTTPException(status_code=501, detail="stubhub_crawler.py is not available")
 from conferank_crawler import (
     crawl_conferank_events,
     ingest_conferank_events_to_eagle,
@@ -68,21 +57,11 @@ from international_conference_alerts_crawler import (
     crawl_ica_events_with_diagnostics,
     ingest_ica_events_to_eagle,
 )
-try:
-    from firecrawl_scraper import (
-        crawl_firecrawl_events_with_diagnostics,
-        ingest_firecrawl_events_to_eagle,
-    )
-except ModuleNotFoundError:
-    async def crawl_firecrawl_events_with_diagnostics(**_: object):
-        raise HTTPException(status_code=501, detail="firecrawl_scraper.py is not available")
-
-    async def ingest_firecrawl_events_to_eagle(**_: object):
-        raise HTTPException(status_code=501, detail="firecrawl_scraper.py is not available")
 from ten_times_crawler import (
     crawl_ten_times_events_with_diagnostics,
     ingest_ten_times_events_to_eagle,
 )
+from ten_times_crawler_new import crawl_ten_times_events_with_playwright_new
 from ten_minute_mail import TenMinuteMailClient
 import httpx
 import uvicorn
@@ -205,6 +184,7 @@ async def get_ten_minute_mail_message_count(
 
 @app.get("/ten-minute-mail/messages")
 async def get_ten_minute_mail_messages(
+    response: Response,
     after_message_id: str = Query("0", description="Only return messages after this id"),
     domain_suffix: Optional[str] = Query(".net", description="Preferred email suffix, e.g. .net or .com"),
 ):
@@ -214,12 +194,18 @@ async def get_ten_minute_mail_messages(
     try:
         ten_minute_mail_client.set_preferred_domain_suffix(domain_suffix)
         email = await ten_minute_mail_client.get_gmail()
-        messages = await ten_minute_mail_client.get_mails(after_message_id=after_message_id)
+        messages_result = await ten_minute_mail_client.get_messages_result(after_message_id=after_message_id)
+        if messages_result.rate_limited and not messages_result.stale:
+            response.status_code = 429
         return {
             "address": email.address,
             "secondsLeft": email.seconds_left,
-            "count": len(messages),
-            "messages": messages,
+            "rateLimited": messages_result.rate_limited,
+            "retryAfterSeconds": messages_result.retry_after_seconds,
+            "stale": messages_result.stale,
+            "messageCount": messages_result.message_count,
+            "count": len(messages_result.messages),
+            "messages": messages_result.messages,
         }
     except Exception as e:
         logger.error(f"Error getting 10minutemail messages: {e}", exc_info=True)
@@ -230,7 +216,7 @@ async def get_ten_minute_mail_messages(
 async def get_ten_minute_mail_otp(
     after_message_id: str = Query("0", description="Only inspect messages after this id"),
     timeout_seconds: float = Query(60.0, ge=0, le=300, description="How long to poll inbox for OTP"),
-    poll_interval_seconds: float = Query(2.0, ge=0.5, le=30, description="Delay between inbox checks"),
+    poll_interval_seconds: float = Query(10.0, ge=5, le=60, description="Delay between inbox checks"),
     otp_digits: int = Query(4, ge=3, le=8, description="Expected OTP length"),
     sender_contains: Optional[str] = Query("10times", description="Sender/subject/body filter"),
     domain_suffix: Optional[str] = Query(".net", description="Preferred email suffix, e.g. .net or .com"),
@@ -504,42 +490,6 @@ async def ingest_luma_events(request: LumaIngestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/stubhub/events/ingest", response_model=EagleIngestResponse)
-async def ingest_stubhub_events(request: StubHubIngestRequest):
-    """
-    Crawl StubHub search results. Search prefers StubHub's public Algolia-backed
-    search data; detail enrichment parses schema.org JSON-LD from event pages.
-    persist=true is intentionally not wired until Eagle backend adds /stubhub-import.
-    """
-    logger.info(
-        "Received request for StubHub ingest keyword='%s' search_url='%s' source=%s limit=%s persist=%s",
-        request.keyword,
-        request.search_url,
-        request.source,
-        request.limit,
-        request.persist,
-    )
-    try:
-        crawl_result = await crawl_stubhub_events_with_diagnostics(
-            keyword=request.keyword,
-            search_url=request.search_url,
-            source=request.source,
-            limit=request.limit,
-            enrich_details=request.enrich_details,
-        )
-        events = _apply_request_category(crawl_result["events"], request.category)
-        return await ingest_stubhub_events_to_eagle(
-            organization_id=request.organization_id,
-            workspace_id=request.workspace_id,
-            events=events,
-            parse_failures=crawl_result["parse_failures"],
-            diagnostics=crawl_result.get("diagnostics", {}),
-            persist=request.persist,
-        )
-    except Exception as e:
-        logger.error(f"Error crawling StubHub: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/conferank/events/ingest", response_model=EagleIngestResponse)
 async def ingest_conferank_events(request: ConferankIngestRequest):
     try:
@@ -649,53 +599,6 @@ async def ingest_discover_events(request: DiscoverEventsIngestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/firecrawl-scraper/events/ingest", response_model=EagleIngestResponse)
-async def ingest_firecrawl_scraper_events(request: FirecrawlScraperIngestRequest):
-    """
-    Generic Firecrawl-backed scraper.
-    It scrapes exactly one list URL, extracts detail links, scrapes only those
-    detail pages, then maps the result into the existing MICE scraper import.
-    This intentionally avoids Firecrawl crawl/map endpoints to keep credit usage predictable.
-    """
-    logger.info(
-        "Received Firecrawl scraper ingest list_url='%s' limit=%s persist=%s",
-        request.list_url,
-        request.limit,
-        request.persist,
-    )
-    try:
-        crawl_result = await crawl_firecrawl_events_with_diagnostics(
-            list_url=request.list_url,
-            limit=request.limit,
-            event_url_regex=request.event_url_regex,
-            include_url_patterns=request.include_url_patterns,
-            exclude_url_patterns=request.exclude_url_patterns,
-            same_domain_only=request.same_domain_only,
-            enrich_details=request.enrich_details,
-            detail_concurrency=request.detail_concurrency,
-            wait_for_ms=request.wait_for_ms,
-            timeout_ms=request.timeout_ms,
-            max_age_ms=request.max_age_ms,
-            firecrawl_proxy=request.firecrawl_proxy,
-            location_country=request.location_country,
-            location_languages=request.location_languages,
-            source_provider=request.source_provider,
-            event_type=request.event_type,
-        )
-        events = _apply_request_category(crawl_result["events"], request.category)
-        return await ingest_firecrawl_events_to_eagle(
-            organization_id=request.organization_id,
-            workspace_id=request.workspace_id,
-            events=events,
-            parse_failures=crawl_result["parse_failures"],
-            diagnostics=crawl_result.get("diagnostics", {}),
-            persist=request.persist,
-        )
-    except Exception as e:
-        logger.error(f"Error crawling Firecrawl scraper events: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/firecrawl-scraper/events/ingest")
 async def firecrawl_scraper_ingest_usage():
     return {
@@ -759,6 +662,56 @@ async def get_ten_times_events(
         }
     except Exception as e:
         logger.error(f"Error crawling 10times: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ten-times-new/events", response_model=TenTimesCrawlResponse)
+async def get_ten_times_events_new(
+    list_url: str = Query(
+        "https://10times.com/newyork-us/conferences",
+        description="10times list URL, e.g. https://10times.com/newyork-us/conferences",
+    ),
+    limit: int = Query(50, ge=1, le=2000, description="Max events to return"),
+    pages: int = Query(1, ge=0, le=200, description="List pages to crawl. Use 0 to crawl until no new events are found."),
+    max_pages: int = Query(100, ge=1, le=200, description="Safety cap when pages=0"),
+    enrich_details: bool = Query(True, description="Fetch detail pages"),
+    headless: bool = Query(False, description="Run Playwright browser in headless mode"),
+    refresh_account_on_wall: bool = Query(True, description="Create a fresh temporary-email 10times login when the daily/research wall appears"),
+    cloudflare_manual_wait_seconds: float = Query(180.0, ge=0, le=900, description="When Cloudflare security verification appears in headed mode, wait this many seconds for manual completion"),
+):
+    """
+    Crawl 10times with Playwright-rendered HTML and parse it with the 10times parser.
+    """
+    logger.info(
+        "Received new Playwright 10times crawl list_url='%s' limit=%s pages=%s max_pages=%s enrich_details=%s headless=%s refresh_account_on_wall=%s cloudflare_manual_wait_seconds=%s",
+        list_url,
+        limit,
+        pages,
+        max_pages,
+        enrich_details,
+        headless,
+        refresh_account_on_wall,
+        cloudflare_manual_wait_seconds,
+    )
+    try:
+        crawl_result = await crawl_ten_times_events_with_playwright_new(
+            list_url=list_url,
+            limit=limit,
+            pages=pages,
+            max_pages=max_pages,
+            enrich_details=enrich_details,
+            headless=headless,
+            refresh_account_on_wall=refresh_account_on_wall,
+            cloudflare_manual_wait_seconds=cloudflare_manual_wait_seconds,
+        )
+        return {
+            "count": len(crawl_result["events"]),
+            "events": crawl_result["events"],
+            "parse_failures": crawl_result["parse_failures"],
+            "diagnostics": crawl_result.get("diagnostics", {}),
+        }
+    except Exception as e:
+        logger.error(f"Error crawling 10times with new crawler: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

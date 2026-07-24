@@ -1,0 +1,23 @@
+{
+  "events": [],
+  "parse_failures": [
+    {
+      "url": "https://10times.com/newyork-us/conferences",
+      "reason": "http_status:403",
+      "body_preview": "<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"><meta http-equiv=\"X-UA-Compatible\" content=\"IE=Edge\"><meta name=\"robots\" content=\"noindex,nofollow\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"content-security-policy\" content=\"default-src &#39;none&#39;; script-src &#39;nonce-saUDUkhm0Muw2BrOGLgbHc&#39; &#39;unsafe-eval&#39; https://challenges.cloudflare.com; script-s",
+      "source": "session_html"
+    }
+  ],
+  "diagnostics": {
+    "source": "html_session",
+    "list_url": "https://10times.com/newyork-us/conferences",
+    "pages_requested": 0,
+    "max_pages": 3,
+    "all_pages": true,
+    "brightdata": false,
+    "cookie_path": "D:\\intern\\EaglePoint\\event_crawl\\.ten_times_cookies.json",
+    "list_pages_fetched": 0,
+    "detail_pages_fetched": 0,
+    "login_refresh_triggered": false
+  }
+}
